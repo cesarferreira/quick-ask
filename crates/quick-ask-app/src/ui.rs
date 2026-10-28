@@ -107,6 +107,7 @@ impl QuickAsk {
                 cx.notify();
             }
         });
+
         let appearance = cx.observe_window_appearance(window, |_, window, cx| {
             Theme::change(ThemeMode::from(window.appearance()), Some(window), cx);
             Theme::global_mut(cx).background = transparent_black();
@@ -181,7 +182,6 @@ impl QuickAsk {
             _subscriptions: vec![subscription, activation, appearance],
         };
         this.fit(window);
-        native::show_panel(window, cx);
         this.input.update(cx, |input, cx| input.focus(window, cx));
         if has_account {
             this.connect(false, cx);
@@ -708,6 +708,16 @@ fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Statefu
         .child(Icon::new(icon).size(px(15.)))
 }
 
+fn drag_surface(id: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .cursor(CursorStyle::OpenHand)
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            native::start_drag(window);
+            cx.stop_propagation();
+        })
+}
+
 fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut App) -> AnyElement {
     if message.role == "user" {
         div()
@@ -774,7 +784,13 @@ impl Render for QuickAsk {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &CopyAnswer, _, cx| this.copy_answer(cx)))
-            .on_action(|_: &Quit, _, cx| cx.quit());
+            .on_action(|_: &Quit, _, cx| cx.quit())
+            .child(
+                drag_surface("window-drag-rim")
+                    .h(px(8.))
+                    .w_full()
+                    .flex_shrink_0(),
+            );
 
         if expanded || has_section {
             let title = if self.history_open {
@@ -1081,6 +1097,7 @@ impl Render for QuickAsk {
                 .px_5()
                 .pb_3()
                 .child(left)
+                .child(drag_surface("toolbar-drag-space").flex_1().h(px(28.)))
                 .child(controls),
         );
         if !signed_in && !self.auth_busy {

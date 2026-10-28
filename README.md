@@ -43,6 +43,10 @@ Partial responses are shown until you start another turn, but are not saved or
 included in later model context. Clicking another app or
 pressing Escape dismisses the panel; Quick Ask stays in the menu bar.
 
+Drag the top rim or the empty toolbar space between the model and the icons to
+move the panel. It keeps that position when reopened on the same display during
+the current session. Opening from a different display places it on that display.
+
 The menu bar menu also provides **Show / Hide**, **New Chat**, **Manage ChatGPT
 Usage**, and **Quit**. If another app owns Option+Space, Quick Ask shows a notice
 and uses Control+Option+Space. Disable the conflicting shortcut in ChatGPT

@@ -12,10 +12,27 @@ use objc2_app_kit::{
 use objc2_foundation::NSPoint;
 use objc2_quartz_core::kCACornerCurveContinuous;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::cell::Cell;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
+
+const CORNER_RADIUS: f64 = 26.;
+
+thread_local! {
+    static HAS_SHOWN: Cell<bool> = const { Cell::new(false) };
+}
+
+fn should_recenter(
+    first_show: bool,
+    window_center: (f64, f64),
+    display: (f64, f64, f64, f64),
+) -> bool {
+    let (x, y) = window_center;
+    let (left, bottom, width, height) = display;
+    first_show || x < left || x >= left + width || y < bottom || y >= bottom + height
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEvent {
@@ -166,6 +183,22 @@ pub fn panel_visible(window: &Window) -> bool {
     native_window(window).is_some_and(|native| native.isVisible())
 }
 
+pub fn start_drag(window: &Window) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(native) = native_window(window) else {
+        return;
+    };
+    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+        return;
+    };
+    native.setMovable(true);
+    // AppKit returns immediately; hand off the original mouse-down event while
+    // it is still being dispatched, before any queued mouse-up can arrive.
+    native.performWindowDragWithEvent(&event);
+}
+
 /// Let AppKit composite a real glass surface beneath the transparent Metal view.
 pub fn install_glass(window: &mut Window) {
     let Some(mtm) = MainThreadMarker::new() else {
@@ -186,7 +219,7 @@ pub fn install_glass(window: &mut Window) {
     // glass. A separate GPUI circular radius produces a second visible edge.
     content.setWantsLayer(true);
     if let Some(layer) = content.layer() {
-        layer.setCornerRadius(26.0);
+        layer.setCornerRadius(CORNER_RADIUS);
         layer.setCornerCurve(unsafe { kCACornerCurveContinuous });
         layer.setMasksToBounds(true);
     }
@@ -196,7 +229,7 @@ pub fn install_glass(window: &mut Window) {
     }
     let glass = NSGlassEffectView::new(mtm);
     glass.setFrame(content.frame());
-    glass.setCornerRadius(26.0);
+    glass.setCornerRadius(CORNER_RADIUS);
     glass.setStyle(NSGlassEffectViewStyle::Regular);
     glass.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
@@ -205,6 +238,21 @@ pub fn install_glass(window: &mut Window) {
     native.setBackgroundColor(Some(&NSColor::clearColor()));
     native.setContentView(Some(&glass));
     glass.setContentView(Some(&content));
+    // GPUI seeds the outer AppKit frame's backing layer with alpha 0.0001.
+    // Clearing NSWindow.backgroundColor does not clear that existing layer:
+    // WindowServer still sees a rectangular surface and caches its shadow.
+    if let Some(frame) = unsafe { glass.superview() } {
+        frame.setWantsLayer(true);
+        if let Some(layer) = frame.layer() {
+            layer.setBackgroundColor(None);
+            layer.setCornerRadius(CORNER_RADIUS);
+            layer.setCornerCurve(unsafe { kCACornerCurveContinuous });
+            layer.setMasksToBounds(true);
+        }
+    }
+    glass.layoutSubtreeIfNeeded();
+    native.invalidateShadow();
+
     window.refresh();
 }
 
@@ -265,6 +313,22 @@ fn position_on_cursor_display(window: &NSWindow) {
     // window frames, including displays left of or below the primary display.
     let screen = screen.visibleFrame();
     let frame = window.frame();
+    let first_show = HAS_SHOWN.with(|shown| !shown.replace(true));
+    if !should_recenter(
+        first_show,
+        (
+            frame.origin.x + frame.size.width / 2.,
+            frame.origin.y + frame.size.height / 2.,
+        ),
+        (
+            screen.origin.x,
+            screen.origin.y,
+            screen.size.width,
+            screen.size.height,
+        ),
+    ) {
+        return;
+    }
     let padding = 20.0;
     let left = screen.origin.x + padding;
     let right = (screen.origin.x + screen.size.width - frame.size.width - padding).max(left);
@@ -292,4 +356,37 @@ fn menu_bar_icon() -> Result<Icon> {
         }
     }
     Icon::from_rgba(rgba, SIDE as u32, SIDE as u32).context("Could not draw the menu bar icon")
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::should_recenter;
+
+    #[test]
+    fn reopening_preserves_a_dragged_position_on_the_same_display() {
+        assert!(!should_recenter(false, (380., 500.), (0., 0., 1440., 900.)));
+    }
+
+    #[test]
+    fn reopening_preserves_position_on_a_display_left_of_the_primary() {
+        assert!(!should_recenter(
+            false,
+            (-800., 450.),
+            (-1920., 0., 1920., 1080.)
+        ));
+    }
+
+    #[test]
+    fn first_open_uses_the_initial_placement() {
+        assert!(should_recenter(true, (380., 500.), (0., 0., 1440., 900.)));
+    }
+
+    #[test]
+    fn opening_on_another_display_places_the_panel_there() {
+        assert!(should_recenter(
+            false,
+            (380., 500.),
+            (-1920., 0., 1920., 1080.)
+        ));
+    }
 }
