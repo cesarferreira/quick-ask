@@ -10,7 +10,7 @@ use gpui_component::{
 };
 use quick_ask_core::{
     auth::{AccountSummary, AuthManager},
-    chat::{self, Message, Model},
+    chat::{self, Message, Model, ReplyOptions},
     history::{Conversation, HistoryStore},
 };
 use std::{
@@ -278,6 +278,11 @@ impl QuickAsk {
         self.error = None;
         self.status.clear();
         let model = self.models[self.selected_model].id.clone();
+        let reasoning_effort =
+            self.models[self.selected_model].resolve_effort(self.conversation.reasoning_effort);
+        if let Some(effort) = reasoning_effort {
+            self.conversation.reasoning_effort = effort;
+        }
         self.conversation.model = model.clone();
         let mut messages = self.conversation.messages.clone();
         messages.push(Message {
@@ -293,9 +298,18 @@ impl QuickAsk {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Account storage is unavailable"))?
                     .access_token()?;
-                chat::stream_reply(&token, &model, &messages, &cancel, |text| {
-                    let _ = tx.send(Event::Delta(id, text));
-                })
+                chat::stream_reply(
+                    &token,
+                    ReplyOptions {
+                        model: &model,
+                        reasoning_effort,
+                    },
+                    &messages,
+                    &cancel,
+                    |text| {
+                        let _ = tx.send(Event::Delta(id, text));
+                    },
+                )
             })()
             .map_err(|error| format!("{error:#}"));
             let _ = tx.send(Event::Finished(id, result));
@@ -314,12 +328,14 @@ impl QuickAsk {
     fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel.store(true, Ordering::Relaxed);
         self.turn.reset();
+        let reasoning_effort = self.conversation.reasoning_effort;
         self.conversation = Conversation::new(
             self.models
                 .get(self.selected_model)
                 .map(|m| m.id.clone())
                 .unwrap_or_default(),
         );
+        self.conversation.reasoning_effort = reasoning_effort;
         self.history_open = false;
         self.models_open = false;
         self.settings_open = false;
@@ -348,7 +364,7 @@ impl QuickAsk {
         } else if self.history_open {
             (180. + self.conversations.len().max(1) as f32 * 64.).min(540.)
         } else if self.models_open {
-            (180. + self.models.len() as f32 * 36.).min(500.)
+            (268. + self.models.len() as f32 * 36.).min(540.)
         } else if expanded {
             let message_height = |text: &str| {
                 let lines: usize = text
@@ -614,14 +630,52 @@ impl QuickAsk {
             .flex()
             .flex_col()
             .gap_1()
-            .p_4()
-            .child(
-                div()
-                    .pb_2()
-                    .text_size(px(12.))
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Models available with your ChatGPT plan"),
-            );
+            .p_4();
+        if let Some(model) = self.models.get(self.selected_model)
+            && !model.reasoning_efforts.is_empty()
+        {
+            let selected = model.resolve_effort(self.conversation.reasoning_effort);
+            let mut choices = div().flex().gap_1().pb_4();
+            for effort in &model.reasoning_efforts {
+                let effort = *effort;
+                choices = choices.child(
+                    pill(("choose-effort", effort as usize), effort.label())
+                        .flex_1()
+                        .text_center()
+                        .when(selected == Some(effort), |s| {
+                            s.bg(rgba(0x0a84ff22)).text_color(rgb(ACCENT))
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if !this.turn.busy {
+                                this.conversation.reasoning_effort = effort;
+                                this.models_open = false;
+                                if !this.conversation.messages.is_empty() {
+                                    this.save();
+                                }
+                                this.input.update(cx, |input, cx| input.focus(window, cx));
+                                this.fit(window);
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            list = list
+                .child(
+                    div()
+                        .pb_2()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Reasoning effort"),
+                )
+                .child(choices);
+        }
+        list = list.child(
+            div()
+                .pb_2()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child("Models available with your ChatGPT plan"),
+        );
         for (index, model) in self.models.iter().enumerate() {
             list = list.child(
                 pill(("choose-model", index), model.name.clone())
@@ -630,7 +684,15 @@ impl QuickAsk {
                         s.bg(rgba(0x80808015)).text_color(rgb(ACCENT))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.turn.busy {
+                            return;
+                        }
                         this.selected_model = index;
+                        if let Some(effort) =
+                            this.models[index].resolve_effort(this.conversation.reasoning_effort)
+                        {
+                            this.conversation.reasoning_effort = effort;
+                        }
                         this.models_open = false;
                         this.fit(window);
                         cx.notify();
@@ -796,7 +858,7 @@ impl Render for QuickAsk {
             let title = if self.history_open {
                 "Chats"
             } else if self.models_open {
-                "Models"
+                "Model & reasoning"
             } else if self.settings_open {
                 "Account"
             } else {
@@ -1016,6 +1078,26 @@ impl Render for QuickAsk {
                         }
                     })),
             );
+            if let Some(effort) =
+                self.models[self.selected_model].resolve_effort(self.conversation.reasoning_effort)
+            {
+                left = left.child(
+                    pill("reasoning-effort", effort.label())
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(Icon::new(IconName::ChevronDown).size(px(11.)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if !this.turn.busy {
+                                this.models_open = !this.models_open;
+                                this.history_open = false;
+                                this.settings_open = false;
+                                this.fit(window);
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
         } else {
             left = left.child(div().text_size(px(12.)).child("Quick Ask"));
         }

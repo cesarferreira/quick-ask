@@ -11,6 +11,30 @@ use std::{
 const MAX_EVENT_BYTES: usize = 1_048_576;
 const MAX_ERROR_BYTES: u64 = 65_536;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+}
+
+pub struct ReplyOptions<'a> {
+    pub model: &'a str,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
@@ -21,6 +45,19 @@ pub struct Message {
 pub struct Model {
     pub id: String,
     pub name: String,
+    pub reasoning_efforts: Vec<ReasoningEffort>,
+}
+
+impl Model {
+    pub fn resolve_effort(&self, preferred: ReasoningEffort) -> Option<ReasoningEffort> {
+        if self.reasoning_efforts.contains(&preferred) {
+            Some(preferred)
+        } else if self.reasoning_efforts.contains(&ReasoningEffort::Medium) {
+            Some(ReasoningEffort::Medium)
+        } else {
+            self.reasoning_efforts.first().copied()
+        }
+    }
 }
 
 pub fn list_models(access_token: &str) -> Result<Vec<Model>> {
@@ -63,6 +100,24 @@ fn list_models_at(base: &str, access_token: &str) -> Result<Vec<Model>> {
                 (Some(id), Some(name)) => Ok(Model {
                     id: id.into(),
                     name: name.into(),
+                    reasoning_efforts: match model
+                        .get("supported_reasoning_levels")
+                        .and_then(Value::as_array)
+                    {
+                        Some(levels) => [
+                            ReasoningEffort::Low,
+                            ReasoningEffort::Medium,
+                            ReasoningEffort::High,
+                        ]
+                        .into_iter()
+                        .filter(|effort| {
+                            levels
+                                .iter()
+                                .any(|level| level["effort"] == effort.label().to_lowercase())
+                        })
+                        .collect(),
+                        None => vec![],
+                    },
                 }),
                 _ => bail!("OpenAI returned an invalid model catalog."),
             }
@@ -72,7 +127,7 @@ fn list_models_at(base: &str, access_token: &str) -> Result<Vec<Model>> {
 
 pub fn stream_reply(
     access_token: &str,
-    model: &str,
+    options: ReplyOptions<'_>,
     messages: &[Message],
     cancel: &AtomicBool,
     on_delta: impl FnMut(String),
@@ -80,7 +135,7 @@ pub fn stream_reply(
     stream_reply_at(
         "https://api.openai.com/v1",
         access_token,
-        model,
+        options,
         messages,
         cancel,
         on_delta,
@@ -91,12 +146,13 @@ pub fn stream_reply(
 fn stream_reply_at(
     base: &str,
     access_token: &str,
-    model: &str,
+    options: ReplyOptions<'_>,
     messages: &[Message],
     cancel: &AtomicBool,
     mut on_delta: impl FnMut(String),
     timeout: Duration,
 ) -> Result<()> {
+    let model = options.model;
     if cancel.load(Ordering::Relaxed) {
         bail!("Response cancelled.");
     }
@@ -109,13 +165,16 @@ fn stream_reply_at(
     {
         bail!("This conversation contains an unsupported message role.");
     }
-    let payload = json!({
+    let mut payload = json!({
         "model": model,
         "input": messages,
         "instructions": "You are a helpful assistant. Give clear, concise answers unless the user asks for detail.",
         "store": false,
         "stream": true,
     });
+    if let Some(effort) = options.reasoning_effort {
+        payload["reasoning"] = json!({ "effort": effort });
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -481,6 +540,79 @@ mod tests {
     }
 
     #[test]
+    fn inference_sends_the_selected_effort_and_omits_it_when_unavailable() {
+        for (effort, expected) in [
+            (Some(ReasoningEffort::Low), json!({"effort": "low"})),
+            (Some(ReasoningEffort::Medium), json!({"effort": "medium"})),
+            (Some(ReasoningEffort::High), json!({"effort": "high"})),
+            (None, Value::Null),
+        ] {
+            let (base, request) = server(
+                200,
+                "data: {\"type\":\"response.completed\"}\n\n",
+                Duration::ZERO,
+            );
+            stream_reply_at(
+                &base,
+                "private-token",
+                ReplyOptions {
+                    model: "fast",
+                    reasoning_effort: effort,
+                },
+                &[Message {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                }],
+                &AtomicBool::new(false),
+                |_| {},
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let request = request.recv().unwrap();
+            let payload: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                payload.get("reasoning"),
+                if expected.is_null() {
+                    None
+                } else {
+                    Some(&expected)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_limits_efforts_and_resolves_unsupported_selections() {
+        let (base, _) = server(
+            200,
+            r#"{"models":[
+            {"slug":"limited","display_name":"Limited","visibility":"list","supported_reasoning_levels":[{"effort":"high"},{"effort":"xhigh"}]},
+            {"slug":"plain","display_name":"Plain","visibility":"list","supported_reasoning_levels":[]},
+            {"slug":"standard","display_name":"Standard","visibility":"list","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]},
+            {"slug":"unknown","display_name":"Unknown","visibility":"list"}
+        ]}"#,
+            Duration::ZERO,
+        );
+        let models = list_models_at(&base, "private-token").unwrap();
+        assert_eq!(models[0].reasoning_efforts, vec![ReasoningEffort::High]);
+        assert_eq!(
+            models[0].resolve_effort(ReasoningEffort::Low),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(models[1].resolve_effort(ReasoningEffort::High), None);
+        assert_eq!(
+            models[2].resolve_effort(ReasoningEffort::Low),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(
+            models[2].resolve_effort(ReasoningEffort::High),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(models[3].resolve_effort(ReasoningEffort::Medium), None);
+    }
+
+    #[test]
     fn inference_sends_subscription_compatible_history_and_streams_text() {
         let (base, request) = server(
             200,
@@ -505,7 +637,10 @@ mod tests {
         stream_reply_at(
             &base,
             "private-token",
-            "fast",
+            ReplyOptions {
+                model: "fast",
+                reasoning_effort: None,
+            },
             &messages,
             &AtomicBool::new(false),
             |text| output.push_str(&text),
@@ -640,7 +775,10 @@ mod tests {
         let error = stream_reply_at(
             &base,
             "private-token",
-            "fast",
+            ReplyOptions {
+                model: "fast",
+                reasoning_effort: None,
+            },
             &[Message {
                 role: "user".into(),
                 content: "Hi".into(),
@@ -711,7 +849,10 @@ mod tests {
             let result = stream_reply_at(
                 &base,
                 "private-token",
-                "fast",
+                ReplyOptions {
+                    model: "fast",
+                    reasoning_effort: None,
+                },
                 &[Message {
                     role: "user".into(),
                     content: "Hi".into(),
@@ -738,7 +879,10 @@ mod tests {
         let error = stream_reply_at(
             &base,
             "private-token",
-            "fast",
+            ReplyOptions {
+                model: "fast",
+                reasoning_effort: None,
+            },
             &[Message {
                 role: "user".into(),
                 content: "Hi".into(),

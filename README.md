@@ -13,7 +13,14 @@ systems fall back to macOS vibrancy.
 1. Open `Quick Ask.app`, or run the development command below.
 2. Select **Continue with ChatGPT** and finish signing in in your browser.
 3. Allow the app to use your ChatGPT plan if that permission is offered.
-4. Choose an available model in the footer and ask a question.
+4. Choose an available model and reasoning effort in the footer, then ask a question.
+
+Click the effort label beside the model to pick **Low**, **Medium**, or **High**.
+Low favors speed, Medium balances speed and depth, and High gives the model more
+time to reason. Medium is the initial setting. The choice is saved with each
+completed conversation and carried into new chats during the current session.
+Only choices reported as supported by the model catalog are shown. Models without
+reasoning metadata use their server default.
 
 The app has been tested with browser sign-in, Keychain credential persistence,
 the account's live model catalog, and a real subscription-backed reply.

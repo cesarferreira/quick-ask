@@ -1,4 +1,4 @@
-use crate::chat::Message;
+use crate::chat::{Message, ReasoningEffort};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,6 +17,8 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
     pub messages: Vec<Message>,
     pub updated_at: u64,
 }
@@ -27,6 +29,7 @@ impl Conversation {
             id: Uuid::new_v4().to_string(),
             title: "New chat".into(),
             model,
+            reasoning_effort: ReasoningEffort::default(),
             messages: Vec::new(),
             updated_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -127,6 +130,7 @@ mod tests {
             id: format!("id-{updated_at}"),
             title: title.into(),
             model: "fast".into(),
+            reasoning_effort: ReasoningEffort::High,
             messages: vec![Message {
                 role: "user".into(),
                 content: "café 🙂".into(),
@@ -157,6 +161,7 @@ mod tests {
         );
         assert_eq!(loaded[0].messages[0].content, "café 🙂");
         assert_eq!(loaded[0].model, "fast");
+        assert_eq!(loaded[0].reasoning_effort, ReasoningEffort::High);
         store.save(&[conversation("Replacement", 30)]).unwrap();
         assert_eq!(store.load().unwrap()[0].title, "Replacement");
         assert_eq!(
@@ -193,6 +198,25 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn older_history_without_effort_loads_as_medium_and_remains_writable() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("history.json"),
+            r#"[{"id":"old","title":"Earlier chat","model":"fast","messages":[],"updated_at":1}]"#,
+        )
+        .unwrap();
+        let store = HistoryStore::new(directory.path().into());
+        let mut loaded = store.load().unwrap();
+        assert_eq!(loaded[0].reasoning_effort, ReasoningEffort::Medium);
+        loaded[0].reasoning_effort = ReasoningEffort::Low;
+        store.save(&loaded).unwrap();
+        assert_eq!(
+            store.load().unwrap()[0].reasoning_effort,
+            ReasoningEffort::Low
         );
     }
 
