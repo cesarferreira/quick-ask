@@ -46,6 +46,11 @@ sign-in so you can switch browser profiles and try again.
 
 The keyboard shortcuts other than the global show/hide shortcut apply while the
 panel has focus. Click **Stop** to cancel a response and close its connection.
+Each question and response has a copy button beneath it. Responses copy their
+original Markdown, including code fences. Code blocks also have their own copy
+button in the upper-right corner, which copies just the code. These controls are
+available while a response streams, too. The footer copy button and Command+Shift+C
+continue to copy the current or latest answer.
 Partial responses are shown until you start another turn, but are not saved or
 included in later model context. Clicking another app or
 pressing Escape dismisses the panel; Quick Ask stays in the menu bar.

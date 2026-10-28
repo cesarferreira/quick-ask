@@ -6,7 +6,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Icon, IconName, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
-    text::TextView,
+    text::{TextView, TextViewStyle},
 };
 use quick_ask_core::{
     auth::{AccountSummary, AuthManager},
@@ -371,7 +371,7 @@ impl QuickAsk {
                     .lines()
                     .map(|line| line.chars().count().div_ceil(68).max(1))
                     .sum();
-                34. + lines.max(1) as f32 * 22.
+                66. + lines.max(1) as f32 * 22.
             };
             let mut content: f32 = self
                 .conversation
@@ -734,10 +734,15 @@ impl QuickAsk {
                         .child("Thinking…"),
                 );
             } else if !self.turn.text.is_empty() {
-                list = list.child(
-                    TextView::markdown("streaming-answer", self.turn.text.clone(), window, cx)
-                        .selectable(true),
-                );
+                list = list.child(message_view(
+                    self.conversation.messages.len() + 1,
+                    &Message {
+                        role: "assistant".into(),
+                        content: self.turn.text.clone(),
+                    },
+                    window,
+                    cx,
+                ));
             }
         }
         list.into_any_element()
@@ -756,7 +761,7 @@ fn pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Di
         .child(label.into())
 }
 
-fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Stateful<Div> {
+fn icon_button(id: impl Into<ElementId>, icon: IconName, label: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(28.))
@@ -768,6 +773,15 @@ fn icon_button(id: &'static str, icon: IconName, label: &'static str) -> Statefu
         .hover(|s| s.bg(rgba(0x8080801a)))
         .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
         .child(Icon::new(icon).size(px(15.)))
+}
+
+fn copy_button(id: impl Into<ElementId>, text: SharedString, label: &'static str) -> Stateful<Div> {
+    icon_button(id, IconName::Copy, label)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            cx.stop_propagation();
+        })
 }
 
 fn drag_surface(id: &'static str) -> Stateful<Div> {
@@ -783,8 +797,11 @@ fn drag_surface(id: &'static str) -> Stateful<Div> {
 fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut App) -> AnyElement {
     if message.role == "user" {
         div()
+            .id(("question", index))
             .flex()
-            .justify_end()
+            .flex_col()
+            .items_end()
+            .gap_1()
             .child(
                 div()
                     .max_w(px(530.))
@@ -796,14 +813,44 @@ fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut A
                     .text_size(px(14.))
                     .child(message.content.clone()),
             )
+            .child(
+                copy_button(
+                    "copy-question",
+                    message.content.clone().into(),
+                    "Copy question",
+                )
+                .text_color(cx.theme().muted_foreground),
+            )
             .into_any_element()
     } else {
         div()
+            .id(("response", index))
+            .flex()
+            .flex_col()
+            .gap_1()
             .text_size(px(14.))
             .line_height(relative(1.55))
             .child(
                 TextView::markdown(("answer", index), message.content.clone(), window, cx)
-                    .selectable(true),
+                    .selectable(true)
+                    .style(TextViewStyle::default().code_block(div().pr_12().style().clone()))
+                    .code_block_actions(|block, _, cx| {
+                        let code = block.code();
+                        // Sibling blocks share the renderer's ID; their owned code allocations
+                        // keep copy controls distinct even when two blocks contain the same text.
+                        let id = ("copy-code", code.as_ptr() as usize);
+                        copy_button(id, code, "Copy code").text_color(cx.theme().muted_foreground)
+                    }),
+            )
+            .child(
+                div().child(
+                    copy_button(
+                        "copy-response",
+                        message.content.clone().into(),
+                        "Copy response as Markdown",
+                    )
+                    .text_color(cx.theme().muted_foreground),
+                ),
             )
             .into_any_element()
     }
