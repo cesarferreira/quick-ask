@@ -7,7 +7,7 @@ use gpui::{App, Window};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSColor, NSEvent,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSScreen, NSView, NSWindow,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSScreen, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::NSPoint;
 use objc2_quartz_core::kCACornerCurveContinuous;
@@ -174,6 +174,10 @@ pub fn install_glass(window: &mut Window) {
     let Some(native) = native_window(window) else {
         return;
     };
+    // GPUI's titlebar: None still sets Titled | FullSizeContentView, which
+    // leaves an NSThemeFrame outline outside the glass. Use an actual borderless
+    // panel, retaining NonactivatingPanel so typing does not activate the app.
+    native.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
     native.setHasShadow(true);
     let Some(content) = native.contentView() else {
         return;
