@@ -8,6 +8,12 @@ description = "A small, native keyboard-first ChatGPT launcher for macOS"
 [dependencies]
 quick-ask-core = { path = "../quick-ask-core" }
 anyhow.workspace = true
+reqwest.workspace = true
+base64 = "0.22"
+futures-channel = "0.3"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+gif = "=0.14.2"
+image-webp = "=0.2.4"
 serde_json.workspace = true
 dirs.workspace = true
 gpui = { version = "=0.2.2", default-features = false }
@@ -21,3 +27,6 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSWorkspace", "NSScreen", "NSWindow", "NSGlassEffectView", "NSColor", "NSView", "NSAppearance"] }
 objc2-foundation = "0.3"
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
+
+[dev-dependencies]
+futures-lite = "2"

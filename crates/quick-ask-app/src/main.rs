@@ -1,3 +1,5 @@
+mod image_http;
+mod live_markdown;
 mod native;
 mod turn;
 mod ui;
@@ -29,7 +31,9 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let auth = Arc::new(Mutex::new(AuthManager::new(data_dir.clone())?));
-    let app = Application::new().with_assets(gpui_component_assets::Assets);
+    let app = Application::new()
+        .with_assets(image_http::ImageAssets)
+        .with_http_client(Arc::new(image_http::ImageHttpClient::new()?));
     app.on_reopen(|cx| {
         if let Some(handle) = cx.windows().first().copied() {
             let view = cx.try_global::<PanelView>().map(|panel| panel.0.clone());

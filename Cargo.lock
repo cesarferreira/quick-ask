@@ -5202,11 +5202,17 @@ name = "quick-ask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs 6.0.0",
+ "futures-channel",
+ "futures-lite 2.6.1",
+ "gif",
  "global-hotkey",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "image",
+ "image-webp",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -5214,6 +5220,7 @@ dependencies = [
  "open",
  "quick-ask-core",
  "raw-window-handle",
+ "reqwest",
  "serde_json",
  "tray-icon",
 ]

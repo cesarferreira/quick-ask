@@ -1,4 +1,5 @@
 use crate::{
+    live_markdown::{self, BlockKind},
     native::{self, NativeEvent, NativeShell},
     turn::Turn,
 };
@@ -63,6 +64,7 @@ pub struct QuickAsk {
     error: Option<String>,
     status: String,
     scroll: ScrollHandle,
+    follow_reply: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -179,6 +181,7 @@ impl QuickAsk {
             error: None,
             status: String::new(),
             scroll: ScrollHandle::new(),
+            follow_reply: true,
             _subscriptions: vec![subscription, activation, appearance],
         };
         this.fit(window);
@@ -188,7 +191,7 @@ impl QuickAsk {
         }
         cx.spawn_in(window, async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(30)).await;
+                Timer::after(Duration::from_millis(16)).await;
                 if this
                     .update_in(cx, |this, window, cx| this.poll(window, cx))
                     .is_err()
@@ -272,6 +275,8 @@ impl QuickAsk {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         let id = self.turn.begin(prompt.clone());
+        self.follow_reply = true;
+        self.scroll.scroll_to_bottom();
         self.history_open = false;
         self.models_open = false;
         self.settings_open = false;
@@ -328,6 +333,7 @@ impl QuickAsk {
     fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel.store(true, Ordering::Relaxed);
         self.turn.reset();
+        self.follow_reply = true;
         let reasoning_effort = self.conversation.reasoning_effort;
         self.conversation = Conversation::new(
             self.models
@@ -371,7 +377,7 @@ impl QuickAsk {
                     .lines()
                     .map(|line| line.chars().count().div_ceil(68).max(1))
                     .sum();
-                66. + lines.max(1) as f32 * 22.
+                66. + lines.max(1) as f32 * 22. + text.matches("![").count() as f32 * 260.
             };
             let mut content: f32 = self
                 .conversation
@@ -380,7 +386,7 @@ impl QuickAsk {
                 .map(|message| message_height(&message.content))
                 .sum();
             if let Some(prompt) = &self.turn.prompt {
-                content += message_height(prompt) + message_height(&self.turn.text);
+                content += message_height(prompt) + message_height(self.turn.visible_text());
             }
             (190. + content + extra).min(580.)
         } else if self.account.is_none() {
@@ -388,10 +394,13 @@ impl QuickAsk {
         } else {
             132. + extra
         };
-        window.resize(size(
+        let target = size(
             px(620.),
             px((height + if self.composer_expanded { 72. } else { 0. }).min(620.)),
-        ));
+        );
+        if window.bounds().size != target {
+            window.resize(target);
+        }
     }
 
     fn save(&mut self) {
@@ -486,23 +495,11 @@ impl QuickAsk {
                 }
                 Event::Delta(id, text) => {
                     self.turn.delta(id, &text);
-                    self.scroll.scroll_to_bottom();
                 }
                 Event::Finished(id, result) => {
                     if id == self.turn.id && self.turn.busy {
-                        if let Some((prompt, reply)) = self.turn.finish(id, result.is_ok()) {
-                            self.conversation.messages.push(Message {
-                                role: "user".into(),
-                                content: prompt,
-                            });
-                            self.conversation.messages.push(Message {
-                                role: "assistant".into(),
-                                content: reply,
-                            });
-                            self.save();
-                            self.status.clear();
-                        }
                         if let Err(error) = result {
+                            self.turn.finish(id, false);
                             self.error = Some(error);
                             if let Ok(manager) = self.auth.try_lock() {
                                 self.account = manager.account();
@@ -510,13 +507,35 @@ impl QuickAsk {
                             if self.account.is_none() {
                                 self.models.clear();
                             }
+                        } else {
+                            self.turn.network_done = true;
                         }
                     }
                 }
             }
         }
+        changed |= self.turn.advance();
+        if self.turn.network_done
+            && self.turn.busy
+            && let Some((prompt, reply)) = self.turn.finish(self.turn.id, true)
+        {
+            self.conversation.messages.push(Message {
+                role: "user".into(),
+                content: prompt,
+            });
+            self.conversation.messages.push(Message {
+                role: "assistant".into(),
+                content: reply,
+            });
+            self.save();
+            self.status.clear();
+            changed = true;
+        }
         if changed {
             self.fit(window);
+            if self.follow_reply {
+                self.scroll.scroll_to_bottom();
+            }
             cx.notify();
         }
     }
@@ -529,7 +548,7 @@ impl QuickAsk {
 
     fn copy_answer(&mut self, cx: &mut Context<Self>) {
         let text = if !self.turn.text.is_empty() {
-            Some(self.turn.text.clone())
+            Some(self.turn.visible_text().to_owned())
         } else {
             self.conversation
                 .messages
@@ -603,6 +622,8 @@ impl QuickAsk {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.cancel.store(true, Ordering::Relaxed);
                         this.turn.reset();
+                        this.follow_reply = true;
+                        this.scroll.scroll_to_bottom();
                         this.conversation = this.conversations[index].clone();
                         if let Some(i) = this
                             .models
@@ -703,12 +724,36 @@ impl QuickAsk {
     }
 
     fn transcript(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let scroll = self.scroll.clone();
+        let follow = self.follow_reply;
         let mut list = div()
+            .on_children_prepainted(move |_, window, _| {
+                if follow && scroll.max_offset().height + scroll.offset().y > px(1.) {
+                    scroll.scroll_to_bottom();
+                    window.refresh();
+                }
+            })
             .id("transcript")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                if event.delta.pixel_delta(px(20.)).y > px(0.) {
+                    this.follow_reply = false;
+                    cx.notify();
+                } else {
+                    let view = cx.entity();
+                    cx.defer(move |cx| {
+                        view.update(cx, |this, cx| {
+                            if this.scroll.max_offset().height + this.scroll.offset().y <= px(36.) {
+                                this.follow_reply = true;
+                                cx.notify();
+                            }
+                        });
+                    });
+                }
+            }))
             .flex()
             .flex_col()
             .gap_5()
@@ -727,22 +772,22 @@ impl QuickAsk {
                 window,
                 cx,
             ));
-            if self.turn.text.is_empty() && self.turn.busy {
-                list = list.child(
-                    div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Thinking…"),
-                );
-            } else if !self.turn.text.is_empty() {
-                list = list.child(message_view(
+            if !self.turn.visible_text().is_empty() {
+                list = list.child(answer_view(
                     self.conversation.messages.len() + 1,
-                    &Message {
-                        role: "assistant".into(),
-                        content: self.turn.text.clone(),
-                    },
+                    self.turn.visible_text(),
+                    Some(self.turn.id),
                     window,
                     cx,
                 ));
+            }
+            if self.turn.busy {
+                let label = if self.turn.visible_text().is_empty() {
+                    "Thinking…"
+                } else {
+                    "Writing…"
+                };
+                list = list.child(activity_indicator(label, cx));
             }
         }
         list.into_any_element()
@@ -794,6 +839,38 @@ fn drag_surface(id: &'static str) -> Stateful<Div> {
         })
 }
 
+fn activity_indicator(label: &'static str, cx: &App) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .text_size(px(12.))
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children((0..3usize).map(|index| {
+                    div()
+                        .size(px(4.))
+                        .rounded_full()
+                        .bg(rgb(ACCENT))
+                        .with_animation(
+                            ("activity-dot", index),
+                            Animation::new(Duration::from_millis(1200)).repeat(),
+                            move |dot, progress| {
+                                let phase = (progress - index as f32 * 0.16).rem_euclid(1.);
+                                dot.opacity(0.25 + 0.75 * (phase * std::f32::consts::PI).sin())
+                            },
+                        )
+                })),
+        )
+        .child(label)
+        .into_any_element()
+}
+
 fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut App) -> AnyElement {
     if message.role == "user" {
         div()
@@ -823,37 +900,96 @@ fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut A
             )
             .into_any_element()
     } else {
-        div()
-            .id(("response", index))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .text_size(px(14.))
-            .line_height(relative(1.55))
-            .child(
-                TextView::markdown(("answer", index), message.content.clone(), window, cx)
-                    .selectable(true)
-                    .style(TextViewStyle::default().code_block(div().pr_12().style().clone()))
-                    .code_block_actions(|block, _, cx| {
-                        let code = block.code();
-                        // Sibling blocks share the renderer's ID; their owned code allocations
-                        // keep copy controls distinct even when two blocks contain the same text.
-                        let id = ("copy-code", code.as_ptr() as usize);
-                        copy_button(id, code, "Copy code").text_color(cx.theme().muted_foreground)
-                    }),
-            )
-            .child(
-                div().child(
-                    copy_button(
-                        "copy-response",
-                        message.content.clone().into(),
-                        "Copy response as Markdown",
-                    )
-                    .text_color(cx.theme().muted_foreground),
-                ),
-            )
-            .into_any_element()
+        answer_view(index, &message.content, None, window, cx)
     }
+}
+
+fn markdown_view(
+    id: impl Into<ElementId>,
+    text: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> TextView {
+    TextView::markdown(id, text, window, cx)
+        .selectable(true)
+        .style(TextViewStyle::default().code_block(div().pr_12().style().clone()))
+        .code_block_actions(|block, _, cx| {
+            let code = block.code();
+            // Distinct owned code allocations keep sibling copy buttons independent.
+            copy_button(("copy-code", code.as_ptr() as usize), code, "Copy code")
+                .text_color(cx.theme().muted_foreground)
+        })
+}
+
+fn answer_view(
+    index: usize,
+    text: &str,
+    live_turn: Option<u64>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let text: SharedString = text.to_owned().into();
+    let mut answer = div()
+        .id(("response", index))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .text_size(px(14.))
+        .line_height(relative(1.55));
+    if let Some(turn_id) = live_turn {
+        for block in live_markdown::blocks(&text) {
+            let key = SharedString::from(format!("live-block-{turn_id}-{}", block.start));
+            match block.kind {
+                BlockKind::Code { body, .. } => {
+                    answer = answer.child(
+                        div()
+                            .id(key)
+                            .relative()
+                            .p_3()
+                            .pr_12()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted)
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(cx.theme().mono_font_size)
+                            .child(body.to_owned())
+                            .child(
+                                div().absolute().top_2().right_2().child(
+                                    copy_button(
+                                        "copy-live-code",
+                                        body.to_owned().into(),
+                                        "Copy code",
+                                    )
+                                    .text_color(cx.theme().muted_foreground),
+                                ),
+                            ),
+                    );
+                }
+                BlockKind::Markdown => {
+                    let id = if block.complete {
+                        key
+                    } else {
+                        SharedString::from(format!("{key}-{}", block.source.len()))
+                    };
+                    answer = answer.child(markdown_view(
+                        id,
+                        block.source.to_owned().into(),
+                        window,
+                        cx,
+                    ));
+                }
+            }
+        }
+    } else {
+        answer = answer.child(markdown_view(("answer", index), text.clone(), window, cx));
+    }
+    answer
+        .child(
+            div().child(
+                copy_button("copy-response", text, "Copy response as Markdown")
+                    .text_color(cx.theme().muted_foreground),
+            ),
+        )
+        .into_any_element()
 }
 
 impl Render for QuickAsk {
@@ -1007,6 +1143,19 @@ impl Render for QuickAsk {
             body = body.child(self.history_view(cx));
         } else if expanded {
             body = body.child(self.transcript(window, cx));
+            if !self.follow_reply {
+                body = body.child(
+                    div().flex_shrink_0().flex().justify_end().px_5().child(
+                        pill("jump-to-latest", "Jump to latest ↓")
+                            .text_color(muted)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.follow_reply = true;
+                                this.scroll.scroll_to_bottom();
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
         }
 
         if let Some(notice) = &self.notice {

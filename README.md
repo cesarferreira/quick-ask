@@ -63,6 +63,15 @@ Partial responses are shown until you start another turn, but are not saved or
 included in later model context. Clicking another app or
 pressing Escape dismisses the panel; Quick Ask stays in the menu bar.
 
+Animated **Thinking…** and **Writing…** indicators show when a reply is in progress.
+Text appears progressively, and the view follows the latest output. Scroll up to
+pause following; scroll back to the bottom or click **Jump to latest** to resume.
+
+PNG, JPEG, WebP, and GIF images display inline through Markdown links or data
+URLs. Remote images load directly without sending your ChatGPT credentials.
+OpenAI currently [does not support image generation through subscription sign-in](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations),
+so creating new images is unavailable through this connection.
+
 Drag the top rim or the empty toolbar space between the model and the icons to
 move the panel. It keeps that position when reopened on the same display during
 the current session. Opening from a different display places it on that display.
@@ -146,5 +155,5 @@ xcrun swift scripts/generate-icon.swift scripts/icons
 For a faster bundle during development, run `./scripts/package.sh --debug`.
 
 Protocol and storage tests use local fixtures. They do not substitute for a real
-ChatGPT sign-in and live request. Text chat and local history are the scope of
-this version; uploads, voice, web tools, and ChatGPT memory are not implemented.
+ChatGPT sign-in and live request. Chat with inline images and local history are
+supported; uploads, voice, web tools, and ChatGPT memory are not implemented.
