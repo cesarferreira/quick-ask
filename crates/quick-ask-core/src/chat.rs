@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{StatusCode, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    fs::{self, File},
     io::Read,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -10,6 +12,9 @@ use std::{
 
 const MAX_EVENT_BYTES: usize = 1_048_576;
 const MAX_ERROR_BYTES: u64 = 65_536;
+const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_REQUEST_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REQUEST_IMAGES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,10 +40,18 @@ pub struct ReplyOptions<'a> {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +180,7 @@ fn stream_reply_at(
     }
     let mut payload = json!({
         "model": model,
-        "input": messages,
+        "input": request_input(messages, cancel)?,
         "instructions": "You are a helpful assistant. Give clear, concise answers unless the user asks for detail.",
         "store": false,
         "stream": true,
@@ -246,6 +259,111 @@ fn stream_reply_at(
             }
         }
     })
+}
+
+fn request_input(messages: &[Message], cancel: &AtomicBool) -> Result<Vec<Value>> {
+    let mut image_count = 0usize;
+    let mut declared_bytes = 0u64;
+    for message in messages {
+        if !message.images.is_empty() && message.role != "user" {
+            bail!("Images can only be attached to user messages.");
+        }
+        image_count = image_count.saturating_add(message.images.len());
+        if image_count > MAX_REQUEST_IMAGES {
+            bail!(
+                "This conversation contains more than 32 images. Start a new chat or remove images."
+            );
+        }
+        for image in &message.images {
+            let metadata = fs::symlink_metadata(&image.path).map_err(|_| {
+                anyhow!(
+                    "An attached image is missing or unavailable. Remove it and attach it again."
+                )
+            })?;
+            if !metadata.is_file() {
+                bail!("An attached image is not a regular file. Remove it and attach it again.");
+            }
+            if metadata.len() > MAX_IMAGE_BYTES {
+                bail!("An attached image exceeds 8 MiB. Attach a smaller image.");
+            }
+            declared_bytes += metadata.len();
+            if declared_bytes > MAX_REQUEST_IMAGE_BYTES {
+                bail!(
+                    "This conversation exceeds 64 MiB of images. Start a new chat or remove images."
+                );
+            }
+        }
+    }
+    let mut actual_bytes = 0u64;
+    messages
+        .iter()
+        .map(|message| {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("Response cancelled.");
+            }
+            if message.images.is_empty() {
+                return Ok(json!({"role": message.role, "content": message.content}));
+            }
+            let mut content = Vec::with_capacity(message.images.len() + 1);
+            if !message.content.is_empty() {
+                content.push(json!({"type": "input_text", "text": message.content}));
+            }
+            for image in &message.images {
+                content.push(read_image_input(image, &mut actual_bytes)?);
+            }
+            Ok(json!({"role": message.role, "content": content}))
+        })
+        .collect()
+}
+
+fn read_image_input(image: &ImageAttachment, actual_bytes: &mut u64) -> Result<Value> {
+    let mut file = File::open(&image.path).map_err(|_| {
+        anyhow!("An attached image is missing or unavailable. Remove it and attach it again.")
+    })?;
+    let before = file.metadata().map_err(|_| {
+        anyhow!("An attached image could not be read. Remove it and attach it again.")
+    })?;
+    if !before.is_file() {
+        bail!("An attached image is not a regular file. Remove it and attach it again.");
+    }
+    if before.len() > MAX_IMAGE_BYTES {
+        bail!("An attached image exceeds 8 MiB. Attach a smaller image.");
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            anyhow!("An attached image could not be read. Remove it and attach it again.")
+        })?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        bail!("An attached image exceeds 8 MiB. Attach a smaller image.");
+    }
+    let after = file.metadata().map_err(|_| {
+        anyhow!("An attached image changed while being read. Remove it and attach it again.")
+    })?;
+    if bytes.len() as u64 != before.len()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        bail!("An attached image changed while being read. Remove it and attach it again.");
+    }
+    *actual_bytes += bytes.len() as u64;
+    if *actual_bytes > MAX_REQUEST_IMAGE_BYTES {
+        bail!("This conversation exceeds 64 MiB of images. Start a new chat or remove images.");
+    }
+    let mime = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else {
+        bail!("An attached image is not a PNG or JPEG. Remove it and attach it again.");
+    };
+    Ok(json!({
+        "type": "input_image",
+        "image_url": format!("data:{mime};base64,{}", STANDARD.encode(bytes)),
+        "detail": "auto",
+    }))
 }
 
 async fn wait_for_cancellation(cancel: &AtomicBool) {
@@ -467,12 +585,15 @@ mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::{
+        fs::{self, File},
         io::{BufRead, BufReader, Cursor, Write},
         net::TcpListener,
+        path::Path,
         sync::{Arc, atomic::Ordering, mpsc},
         thread,
         time::Instant,
     };
+    use tempfile::tempdir;
 
     fn server(
         status: u16,
@@ -562,6 +683,7 @@ mod tests {
                 &[Message {
                     role: "user".into(),
                     content: "Hi".into(),
+                    images: vec![],
                 }],
                 &AtomicBool::new(false),
                 |_| {},
@@ -623,14 +745,17 @@ mod tests {
             Message {
                 role: "user".into(),
                 content: "Hello?".into(),
+                images: vec![],
             },
             Message {
                 role: "assistant".into(),
                 content: "Earlier answer".into(),
+                images: vec![],
             },
             Message {
                 role: "user".into(),
                 content: "Continue".into(),
+                images: vec![],
             },
         ];
         let mut output = String::new();
@@ -661,6 +786,214 @@ mod tests {
         assert_eq!(payload["model"], "fast");
         assert!(payload["instructions"].is_string());
         assert_eq!(payload.as_object().unwrap().len(), 5);
+    }
+
+    fn message_with_images(role: &str, content: &str, paths: &[(&str, &Path)]) -> Message {
+        serde_json::from_value(json!({
+            "role": role,
+            "content": content,
+            "images": paths.iter().map(|(name, path)| json!({"name": name, "path": path})).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    fn image_payload(messages: &[Message]) -> Value {
+        let (base, request) = server(
+            200,
+            "data: {\"type\":\"response.completed\"}\n\n",
+            Duration::ZERO,
+        );
+        stream_reply_at(
+            &base,
+            "private-token",
+            ReplyOptions {
+                model: "fast",
+                reasoning_effort: None,
+            },
+            messages,
+            &AtomicBool::new(false),
+            |_| {},
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let request = request.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(request.starts_with("POST /v1/responses HTTP/1.1\r\n"));
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    #[test]
+    fn image_input_sends_text_and_multiple_image_data_urls_without_local_metadata() {
+        let directory = tempdir().unwrap();
+        let png = directory.path().join("private-png-location");
+        let jpeg = directory.path().join("private-jpeg-location");
+        fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(&jpeg, b"\xff\xd8\xff\xe0").unwrap();
+        let payload = image_payload(&[message_with_images(
+            "user",
+            "Compare these",
+            &[("private-photo-name", &png), ("second-private-name", &jpeg)],
+        )]);
+        assert_eq!(
+            payload["input"],
+            json!([{"role":"user","content":[
+                {"type":"input_text","text":"Compare these"},
+                {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"},
+                {"type":"input_image","image_url":"data:image/jpeg;base64,/9j/4A==","detail":"auto"}
+            ]}])
+        );
+        assert_eq!(payload["store"], false);
+        assert_eq!(payload["stream"], true);
+        assert_eq!(payload.as_object().unwrap().len(), 5);
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("private-"));
+        assert!(!encoded.contains("images"));
+        assert!(!encoded.contains(directory.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn image_input_replays_earlier_images_in_follow_up_context() {
+        let directory = tempdir().unwrap();
+        let image = directory.path().join("earlier.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let payload = image_payload(&[
+            message_with_images("user", "Describe this", &[("earlier.png", &image)]),
+            message_with_images("assistant", "A picture.", &[]),
+            message_with_images("user", "What color is it?", &[]),
+        ]);
+        assert_eq!(
+            payload["input"],
+            json!([
+                {"role":"user","content":[
+                    {"type":"input_text","text":"Describe this"},
+                    {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}
+                ]},
+                {"role":"assistant","content":"A picture."},
+                {"role":"user","content":"What color is it?"}
+            ])
+        );
+    }
+
+    #[test]
+    fn image_input_allows_an_image_only_user_message() {
+        let directory = tempdir().unwrap();
+        let image = directory.path().join("image.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        let payload = image_payload(&[message_with_images("user", "", &[("image.png", &image)])]);
+        assert_eq!(
+            payload["input"],
+            json!([{"role":"user","content":[
+                {"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo=","detail":"auto"}
+            ]}])
+        );
+    }
+
+    fn assert_image_rejected_before_network(messages: &[Message], expected: &str) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let error = stream_reply_at(
+            &base,
+            "private-token",
+            ReplyOptions {
+                model: "fast",
+                reasoning_effort: None,
+            },
+            messages,
+            &AtomicBool::new(false),
+            |_| panic!("invalid image request emitted text"),
+            Duration::from_millis(100),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("private-token"));
+        assert!(!error.contains("private-location"));
+    }
+
+    #[test]
+    fn image_input_rejects_missing_nonregular_and_invalid_files_before_network() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("private-location-missing.png");
+        let invalid = directory.path().join("private-location-invalid.png");
+        fs::write(&invalid, b"private-token is not an image").unwrap();
+        for (path, expected) in [
+            (missing.as_path(), "attach"),
+            (directory.path(), "regular file"),
+            (invalid.as_path(), "PNG or JPEG"),
+        ] {
+            assert_image_rejected_before_network(
+                &[message_with_images(
+                    "user",
+                    "Describe",
+                    &[("private-token", path)],
+                )],
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn image_input_rejects_images_on_assistant_and_developer_messages() {
+        let directory = tempdir().unwrap();
+        let image = directory.path().join("private-location.png");
+        fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
+        for role in ["assistant", "developer"] {
+            assert_image_rejected_before_network(
+                &[message_with_images(
+                    role,
+                    "Describe",
+                    &[("private-token", &image)],
+                )],
+                "user messages",
+            );
+        }
+    }
+
+    #[test]
+    fn image_input_rejects_file_count_and_total_byte_limits_before_network() {
+        let directory = tempdir().unwrap();
+        let large = directory.path().join("private-location-large.png");
+        let mut file = File::create(&large).unwrap();
+        file.write_all(b"\x89PNG\r\n\x1a\n").unwrap();
+        file.set_len(8 * 1024 * 1024 + 1).unwrap();
+        assert_image_rejected_before_network(
+            &[message_with_images(
+                "user",
+                "Describe",
+                &[("private-token", &large)],
+            )],
+            "8 MiB",
+        );
+        file.set_len(8 * 1024 * 1024).unwrap();
+        assert_image_rejected_before_network(
+            &[
+                message_with_images("user", "Earlier", &[("private-token", large.as_path()); 4]),
+                message_with_images("user", "Describe", &[("private-token", large.as_path()); 5]),
+            ],
+            "64 MiB",
+        );
+        file.set_len(8).unwrap();
+        assert_image_rejected_before_network(
+            &[
+                message_with_images("user", "Earlier", &[("private-token", large.as_path()); 16]),
+                message_with_images(
+                    "user",
+                    "Describe",
+                    &[("private-token", large.as_path()); 17],
+                ),
+            ],
+            "32 images",
+        );
+        let payload = image_payload(&[message_with_images(
+            "user",
+            "Describe",
+            &[("image.png", large.as_path()); 32],
+        )]);
+        assert_eq!(payload["input"][0]["content"].as_array().unwrap().len(), 33);
     }
 
     struct Fragmented<'a>(&'a [u8]);
@@ -782,6 +1115,7 @@ mod tests {
             &[Message {
                 role: "user".into(),
                 content: "Hi".into(),
+                images: vec![],
             }],
             &cancel,
             |_| panic!("cancelled request emitted output"),
@@ -856,6 +1190,7 @@ mod tests {
                 &[Message {
                     role: "user".into(),
                     content: "Hi".into(),
+                    images: vec![],
                 }],
                 &cancel,
                 |_| panic!("a heartbeat emitted answer text"),
@@ -886,6 +1221,7 @@ mod tests {
             &[Message {
                 role: "user".into(),
                 content: "Hi".into(),
+                images: vec![],
             }],
             &AtomicBool::new(false),
             |_| {},

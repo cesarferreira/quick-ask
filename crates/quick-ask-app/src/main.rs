@@ -1,3 +1,5 @@
+mod attachments;
+mod draft_images;
 mod image_http;
 mod live_markdown;
 mod native;

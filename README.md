@@ -30,6 +30,17 @@ completed conversation and carried into new chats during the current session.
 Only choices reported as supported by the model catalog are shown. Models without
 reasoning metadata use their server default.
 
+Drag images onto the panel, or press **Command+V** to paste a screenshot, a copied
+image, or image files copied in Finder. Up to four images can be attached to each
+question. Review the thumbnails and use their **×** buttons to remove an image
+before sending. You can send images with or without text, and ask follow-up
+questions about them. The selected model must support image input.
+
+PNG, JPEG, WebP, GIF, BMP, and TIFF inputs are supported. Large images are resized
+to fit within a 4096-pixel longest edge and 8 MiB per attachment; animated inputs
+use a still frame. Images are copied into private local storage alongside your
+chat history, so moving the original file does not break later questions.
+
 The app has been tested with browser sign-in, Keychain credential persistence,
 the account's live model catalog, and a real subscription-backed reply.
 This first version keeps one saved account registration; an account picker is

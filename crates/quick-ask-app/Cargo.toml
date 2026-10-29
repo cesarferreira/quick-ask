@@ -11,7 +11,8 @@ anyhow.workspace = true
 reqwest.workspace = true
 base64 = "0.22"
 futures-channel = "0.3"
-image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+sha2 = "0.10"
 gif = "=0.14.2"
 image-webp = "=0.2.4"
 serde_json.workspace = true
@@ -24,7 +25,7 @@ tray-icon = "0.24"
 open = "5"
 raw-window-handle = "0.6"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSWorkspace", "NSScreen", "NSWindow", "NSGlassEffectView", "NSColor", "NSView", "NSAppearance"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplication", "NSWorkspace", "NSScreen", "NSWindow", "NSGlassEffectView", "NSColor", "NSView", "NSAppearance", "NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = "0.3"
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
 

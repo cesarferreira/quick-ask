@@ -7,9 +7,10 @@ use gpui::{App, Window};
 use objc2::{MainThreadMarker, rc::Retained};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSColor, NSEvent,
-    NSGlassEffectView, NSGlassEffectViewStyle, NSScreen, NSView, NSWindow, NSWindowStyleMask,
+    NSGlassEffectView, NSGlassEffectViewStyle, NSPasteboard, NSScreen, NSView, NSWindow,
+    NSWindowStyleMask,
 };
-use objc2_foundation::NSPoint;
+use objc2_foundation::{NSPoint, NSString, NSURL};
 use objc2_quartz_core::kCACornerCurveContinuous;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
@@ -19,6 +20,60 @@ use tray_icon::{
 };
 
 const CORNER_RADIUS: f64 = 26.;
+
+pub enum ClipboardImages {
+    Paths(Vec<std::path::PathBuf>),
+    Bytes(Vec<u8>),
+}
+
+pub fn mouse_button_pressed() -> bool {
+    NSEvent::pressedMouseButtons() != 0
+}
+
+pub fn clipboard_images() -> Result<Option<ClipboardImages>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let file_url = NSString::from_str("public.file-url");
+    let paths: Vec<_> = pasteboard
+        .pasteboardItems()
+        .into_iter()
+        .flat_map(|items| items.to_vec())
+        .filter_map(|item| item.stringForType(&file_url))
+        .filter_map(|value| clipboard_file_path(&value.to_string()))
+        .take(5)
+        .collect();
+    if !paths.is_empty() {
+        return Ok(Some(ClipboardImages::Paths(paths)));
+    }
+    // Read image representations before plain text: browsers can publish both an
+    // image and its URL, and Preview commonly provides only TIFF data.
+    for mime in [
+        "public.png",
+        "public.jpeg",
+        "org.webmproject.webp",
+        "com.compuserve.gif",
+        "com.microsoft.bmp",
+        "public.tiff",
+    ] {
+        if let Some(data) = pasteboard.dataForType(&NSString::from_str(mime)) {
+            anyhow::ensure!(
+                data.length() <= 50 * 1024 * 1024,
+                "The clipboard image exceeds 50 MiB."
+            );
+            return Ok(Some(ClipboardImages::Bytes(data.to_vec())));
+        }
+    }
+    Ok(None)
+}
+
+fn clipboard_file_path(value: &str) -> Option<std::path::PathBuf> {
+    let url = NSURL::URLWithString(&NSString::from_str(value))?;
+    if !url.isFileURL() {
+        return None;
+    }
+    // Finder publishes file-reference URLs (/.file/id=...), which need AppKit's
+    // filesystem resolution before they can be opened as ordinary paths.
+    Some(url.filePathURL()?.path()?.to_string().into())
+}
 
 thread_local! {
     static HAS_SHOWN: Cell<bool> = const { Cell::new(false) };
@@ -32,6 +87,45 @@ fn should_recenter(
     let (x, y) = window_center;
     let (left, bottom, width, height) = display;
     first_show || x < left || x >= left + width || y < bottom || y >= bottom + height
+}
+
+fn constrained_origin(
+    origin: (f64, f64),
+    size: (f64, f64),
+    visible: (f64, f64, f64, f64),
+) -> (f64, f64) {
+    (
+        origin
+            .0
+            .clamp(visible.0, visible.0 + (visible.2 - size.0).max(0.)),
+        origin
+            .1
+            .clamp(visible.1, visible.1 + (visible.3 - size.1).max(0.)),
+    )
+}
+
+pub fn keep_panel_on_screen(window: &Window) {
+    let Some(native) = native_window(window) else {
+        return;
+    };
+    let Some(screen) = native.screen() else {
+        return;
+    };
+    let frame = native.frame();
+    let visible = screen.visibleFrame();
+    let origin = constrained_origin(
+        (frame.origin.x, frame.origin.y),
+        (frame.size.width, frame.size.height),
+        (
+            visible.origin.x,
+            visible.origin.y,
+            visible.size.width,
+            visible.size.height,
+        ),
+    );
+    if origin != (frame.origin.x, frame.origin.y) {
+        native.setFrameOrigin(NSPoint::new(origin.0, origin.1));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,7 +454,27 @@ fn menu_bar_icon() -> Result<Icon> {
 
 #[cfg(test)]
 mod placement_tests {
-    use super::should_recenter;
+    use super::{constrained_origin, should_recenter};
+
+    #[test]
+    fn growing_for_images_keeps_the_composer_above_the_bottom_edge() {
+        assert_eq!(
+            constrained_origin((300., -120.), (620., 580.), (0., 40., 1440., 860.)),
+            (300., 40.)
+        );
+    }
+
+    #[test]
+    fn constraining_only_moves_edges_that_leave_the_current_display() {
+        assert_eq!(
+            constrained_origin((-200., 300.), (620., 580.), (-1920., 0., 1920., 1080.)),
+            (-620., 300.)
+        );
+        assert_eq!(
+            constrained_origin((300., 300.), (620., 400.), (0., 40., 1440., 860.)),
+            (300., 300.)
+        );
+    }
 
     #[test]
     fn reopening_preserves_a_dragged_position_on_the_same_display() {
@@ -388,5 +502,29 @@ mod placement_tests {
             (380., 500.),
             (-1920., 0., 1920., 1080.)
         ));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn finder_file_reference_urls_resolve_to_the_original_image_path() {
+        let path =
+            std::env::temp_dir().join(format!("quick-ask-finder-{}.png", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let reference = url
+            .fileReferenceURL()
+            .unwrap()
+            .absoluteString()
+            .unwrap()
+            .to_string();
+        let actual =
+            clipboard_file_path(&reference).and_then(|path| std::fs::canonicalize(path).ok());
+        let expected = std::fs::canonicalize(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(actual, Some(expected));
     }
 }

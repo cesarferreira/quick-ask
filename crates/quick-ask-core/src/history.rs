@@ -134,6 +134,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".into(),
                 content: "café 🙂".into(),
+                images: vec![],
             }],
             updated_at,
         }
@@ -218,6 +219,56 @@ mod tests {
             store.load().unwrap()[0].reasoning_effort,
             ReasoningEffort::Low
         );
+    }
+
+    #[test]
+    fn older_text_messages_without_images_load_and_remain_writable() {
+        let directory = tempdir().unwrap();
+        fs::write(
+            directory.path().join("history.json"),
+            r#"[{"id":"old","title":"Earlier chat","model":"fast","messages":[{"role":"user","content":"Hello"}],"updated_at":1}]"#,
+        )
+        .unwrap();
+        let store = HistoryStore::new(directory.path().into());
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].messages[0].content, "Hello");
+        assert!(loaded[0].messages[0].images.is_empty());
+        store.save(&loaded).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("history.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved[0]["messages"][0],
+            serde_json::json!({"role":"user","content":"Hello"})
+        );
+    }
+
+    #[test]
+    fn history_round_trips_image_references_without_reading_or_embedding_image_bytes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("images").join("absent-image.png");
+        let mut entry = conversation("Image question", 1);
+        entry.messages = vec![
+            serde_json::from_value(serde_json::json!({
+                "role":"user",
+                "content":"Describe this",
+                "images":[{"name":"holiday.png","path":path}]
+            }))
+            .unwrap(),
+        ];
+        let store = HistoryStore::new(directory.path().into());
+        store.save(&[entry]).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded[0].messages[0].images[0].path, path);
+        assert_eq!(loaded[0].messages[0].images[0].name, "holiday.png");
+        let restored = serde_json::to_value(&loaded[0].messages[0]).unwrap();
+        assert_eq!(
+            restored["images"],
+            serde_json::json!([{"name":"holiday.png","path":path}])
+        );
+        let saved = fs::read_to_string(directory.path().join("history.json")).unwrap();
+        assert!(!saved.contains("data:image"));
+        assert!(!path.exists());
     }
 
     #[test]

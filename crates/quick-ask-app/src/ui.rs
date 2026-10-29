@@ -1,4 +1,6 @@
 use crate::{
+    attachments::AttachmentStore,
+    draft_images::DraftImages,
     live_markdown::{self, BlockKind},
     native::{self, NativeEvent, NativeShell},
     turn::Turn,
@@ -11,7 +13,7 @@ use gpui_component::{
 };
 use quick_ask_core::{
     auth::{AccountSummary, AuthManager},
-    chat::{self, Message, Model, ReplyOptions},
+    chat::{self, ImageAttachment, Message, Model, ReplyOptions},
     history::{Conversation, HistoryStore},
 };
 use std::{
@@ -34,6 +36,7 @@ enum Event {
     SignedOut(Result<(), String>),
     Delta(u64, String),
     Finished(u64, Result<(), String>),
+    ImagesImported(u64, Vec<ImageAttachment>, Vec<String>),
 }
 
 pub struct QuickAsk {
@@ -65,10 +68,122 @@ pub struct QuickAsk {
     status: String,
     scroll: ScrollHandle,
     follow_reply: bool,
+    image_store: AttachmentStore,
+    draft_images: DraftImages,
+    turn_images: Vec<ImageAttachment>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl QuickAsk {
+    fn import_images(
+        &mut self,
+        source: native::ClipboardImages,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account.is_none() || self.auth_busy {
+            self.error = Some("Sign in before attaching images.".into());
+            self.fit(window);
+            cx.notify();
+            return;
+        }
+        let count = match &source {
+            native::ClipboardImages::Paths(paths) => paths.len(),
+            native::ClipboardImages::Bytes(_) => 1,
+        };
+        let ticket = match self.draft_images.begin_import(count) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                self.fit(window);
+                cx.notify();
+                return;
+            }
+        };
+        let store = self.image_store.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let results = match source {
+                native::ClipboardImages::Paths(paths) => paths
+                    .iter()
+                    .map(|path| store.import_path(path))
+                    .collect::<Vec<_>>(),
+                native::ClipboardImages::Bytes(bytes) => {
+                    vec![store.import_bytes("Pasted image", &bytes)]
+                }
+            };
+            let mut images = Vec::new();
+            let mut errors = Vec::new();
+            for result in results {
+                match result {
+                    Ok(image) => images.push(image),
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+            let _ = tx.send(Event::ImagesImported(ticket, images, errors));
+        });
+        self.error = None;
+        self.show(window, cx);
+        self.fit(window);
+        cx.notify();
+    }
+
+    fn draft_images_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div()
+            .id("draft-images")
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .pt_3();
+        for image in &self.draft_images.images {
+            let path = image.path.clone();
+            let name = image.name.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("draft-{}", path.display())))
+                    .relative()
+                    .w(px(80.))
+                    .h(px(72.))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(rgba(0x80808025))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(name.clone()).build(window, cx)
+                    })
+                    .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
+                    .child(
+                        div()
+                            .id("remove-image")
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .size(px(20.))
+                            .rounded_full()
+                            .bg(rgba(0x18181bcc))
+                            .text_color(rgb(0xffffff))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(0x0a84ff)))
+                            .child(Icon::new(IconName::Close).size(px(12.)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.draft_images.remove(&path);
+                                this.fit(window);
+                                cx.notify();
+                                cx.stop_propagation();
+                            })),
+                    ),
+            );
+        }
+        if self.draft_images.loading {
+            row = row.child(activity_indicator("Preparing…", cx));
+        }
+        row.into_any_element()
+    }
+
     pub fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -105,8 +220,37 @@ impl QuickAsk {
         });
         let activation = cx.observe_window_activation(window, |_, window, cx| {
             if !window.is_window_active() && native::panel_visible(window) {
-                native::hide_panel(window);
-                cx.notify();
+                cx.spawn_in(window, async move |this, cx| {
+                    loop {
+                        Timer::after(Duration::from_millis(120)).await;
+                        let keep_waiting = this
+                            .update_in(cx, |_, window, cx| {
+                                if window.is_window_active() || !native::panel_visible(window) {
+                                    return false;
+                                }
+                                if native::mouse_button_pressed() {
+                                    return true;
+                                }
+                                native::hide_panel(window);
+                                cx.notify();
+                                false
+                            })
+                            .unwrap_or(false);
+                        if !keep_waiting {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+        });
+
+        let mut last_size = window.bounds().size;
+        let bounds = cx.observe_window_bounds(window, move |_, window, _| {
+            let size = window.bounds().size;
+            if size != last_size {
+                last_size = size;
+                native::keep_panel_on_screen(window);
             }
         });
 
@@ -122,6 +266,7 @@ impl QuickAsk {
             cx.notify();
         });
         let (tx, rx) = mpsc::channel();
+        let image_store = AttachmentStore::new(data_dir.clone());
         let history = HistoryStore::new(data_dir);
         let (conversations, history_writable, load_error) = match history.load() {
             Ok(items) => (items, true, None),
@@ -182,7 +327,10 @@ impl QuickAsk {
             status: String::new(),
             scroll: ScrollHandle::new(),
             follow_reply: true,
-            _subscriptions: vec![subscription, activation, appearance],
+            image_store,
+            draft_images: DraftImages::default(),
+            turn_images: vec![],
+            _subscriptions: vec![subscription, activation, appearance, bounds],
         };
         this.fit(window);
         this.input.update(cx, |input, cx| input.focus(window, cx));
@@ -258,7 +406,16 @@ impl QuickAsk {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.input.read(cx).value().trim().to_owned();
-        if prompt.is_empty() || self.turn.busy || self.auth_busy {
+        if (prompt.is_empty() && self.draft_images.images.is_empty())
+            || self.turn.busy
+            || self.auth_busy
+        {
+            return;
+        }
+        if self.draft_images.loading {
+            self.error = Some("Wait for the images to finish preparing before sending.".into());
+            self.fit(window);
+            cx.notify();
             return;
         }
         if self.account.is_none() || self.models.is_empty() {
@@ -275,6 +432,7 @@ impl QuickAsk {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         let id = self.turn.begin(prompt.clone());
+        self.turn_images = self.draft_images.take();
         self.follow_reply = true;
         self.scroll.scroll_to_bottom();
         self.history_open = false;
@@ -293,6 +451,7 @@ impl QuickAsk {
         messages.push(Message {
             role: "user".into(),
             content: prompt,
+            images: self.turn_images.clone(),
         });
         let auth = self.auth.clone();
         let tx = self.tx.clone();
@@ -333,6 +492,8 @@ impl QuickAsk {
     fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel.store(true, Ordering::Relaxed);
         self.turn.reset();
+        self.draft_images.clear();
+        self.turn_images.clear();
         self.follow_reply = true;
         let reasoning_effort = self.conversation.reasoning_effort;
         self.conversation = Conversation::new(
@@ -383,10 +544,15 @@ impl QuickAsk {
                 .conversation
                 .messages
                 .iter()
-                .map(|message| message_height(&message.content))
+                .map(|message| {
+                    message_height(&message.content)
+                        + message.images.len().div_ceil(3) as f32 * 120.
+                })
                 .sum();
             if let Some(prompt) = &self.turn.prompt {
-                content += message_height(prompt) + message_height(self.turn.visible_text());
+                content += message_height(prompt)
+                    + message_height(self.turn.visible_text())
+                    + self.turn_images.len().div_ceil(3) as f32 * 120.;
             }
             (190. + content + extra).min(580.)
         } else if self.account.is_none() {
@@ -396,7 +562,14 @@ impl QuickAsk {
         };
         let target = size(
             px(620.),
-            px((height + if self.composer_expanded { 72. } else { 0. }).min(620.)),
+            px((height
+                + if self.composer_expanded { 72. } else { 0. }
+                + if self.draft_images.loading || !self.draft_images.images.is_empty() {
+                    88.
+                } else {
+                    0.
+                })
+            .min(620.)),
         );
         if window.bounds().size != target {
             window.resize(target);
@@ -412,7 +585,15 @@ impl QuickAsk {
             .unwrap_or_default()
             .as_secs();
         if let Some(first) = self.conversation.messages.first() {
-            self.conversation.title = first.content.chars().take(70).collect();
+            self.conversation.title = if first.content.trim().is_empty() {
+                first
+                    .images
+                    .first()
+                    .map(|image| image.name.clone())
+                    .unwrap_or_else(|| "Image chat".into())
+            } else {
+                first.content.chars().take(70).collect()
+            };
         }
         self.conversations
             .retain(|item| item.id != self.conversation.id);
@@ -496,6 +677,11 @@ impl QuickAsk {
                 Event::Delta(id, text) => {
                     self.turn.delta(id, &text);
                 }
+                Event::ImagesImported(ticket, images, errors) => {
+                    if self.draft_images.complete(ticket, images) && !errors.is_empty() {
+                        self.error = Some(errors.join("\n"));
+                    }
+                }
                 Event::Finished(id, result) => {
                     if id == self.turn.id && self.turn.busy {
                         if let Err(error) = result {
@@ -522,10 +708,12 @@ impl QuickAsk {
             self.conversation.messages.push(Message {
                 role: "user".into(),
                 content: prompt,
+                images: std::mem::take(&mut self.turn_images),
             });
             self.conversation.messages.push(Message {
                 role: "assistant".into(),
                 content: reply,
+                images: vec![],
             });
             self.save();
             self.status.clear();
@@ -568,6 +756,8 @@ impl QuickAsk {
         }
         self.cancel.store(true, Ordering::Relaxed);
         self.turn.reset();
+        self.draft_images.clear();
+        self.turn_images.clear();
         self.auth_busy = true;
         self.auth_can_cancel = false;
         let auth = self.auth.clone();
@@ -622,6 +812,8 @@ impl QuickAsk {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.cancel.store(true, Ordering::Relaxed);
                         this.turn.reset();
+                        this.draft_images.clear();
+                        this.turn_images.clear();
                         this.follow_reply = true;
                         this.scroll.scroll_to_bottom();
                         this.conversation = this.conversations[index].clone();
@@ -768,6 +960,7 @@ impl QuickAsk {
                 &Message {
                     role: "user".into(),
                     content: prompt.clone(),
+                    images: self.turn_images.clone(),
                 },
                 window,
                 cx,
@@ -873,32 +1066,70 @@ fn activity_indicator(label: &'static str, cx: &App) -> AnyElement {
 
 fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut App) -> AnyElement {
     if message.role == "user" {
-        div()
+        let mut question = div()
             .id(("question", index))
             .flex()
             .flex_col()
             .items_end()
-            .gap_1()
-            .child(
+            .gap_2();
+        if !message.images.is_empty() {
+            question = question.child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
                     .max_w(px(530.))
-                    .rounded_lg()
-                    .px_4()
-                    .py_3()
-                    .bg(rgba(0x80808015))
-                    .text_color(cx.theme().foreground)
-                    .text_size(px(14.))
-                    .child(message.content.clone()),
-            )
-            .child(
-                copy_button(
-                    "copy-question",
-                    message.content.clone().into(),
-                    "Copy question",
+                    .children(
+                        message
+                            .images
+                            .iter()
+                            .enumerate()
+                            .map(|(image_index, image)| {
+                                let name = image.name.clone();
+                                div()
+                                    .id(("question-image", image_index))
+                                    .w(px(156.))
+                                    .h(px(104.))
+                                    .rounded_lg()
+                                    .overflow_hidden()
+                                    .bg(rgba(0x80808015))
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(name.clone())
+                                            .build(window, cx)
+                                    })
+                                    .child(
+                                        img(image.path.clone())
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    )
+                            }),
+                    ),
+            );
+        }
+        if !message.content.is_empty() {
+            question = question
+                .child(
+                    div()
+                        .max_w(px(530.))
+                        .rounded_lg()
+                        .px_4()
+                        .py_3()
+                        .bg(rgba(0x80808015))
+                        .text_color(cx.theme().foreground)
+                        .text_size(px(14.))
+                        .child(message.content.clone()),
                 )
-                .text_color(cx.theme().muted_foreground),
-            )
-            .into_any_element()
+                .child(
+                    copy_button(
+                        "copy-question",
+                        message.content.clone().into(),
+                        "Copy question",
+                    )
+                    .text_color(cx.theme().muted_foreground),
+                );
+        }
+        question.into_any_element()
     } else {
         answer_view(index, &message.content, None, window, cx)
     }
@@ -1005,6 +1236,7 @@ impl Render for QuickAsk {
             rgba(0xffffffa8)
         };
         let mut body = div()
+            .id("quick-ask-panel")
             .key_context("QuickAsk")
             .size_full()
             .flex()
@@ -1013,6 +1245,31 @@ impl Render for QuickAsk {
             .text_color(foreground)
             .font_family(".SystemUIFont")
             .overflow_hidden()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.import_images(
+                    native::ClipboardImages::Paths(paths.paths().to_vec()),
+                    window,
+                    cx,
+                );
+            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgba(0x0a84ff25)))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Paste, window, cx| {
+                    match native::clipboard_images() {
+                        Ok(Some(source)) => {
+                            this.import_images(source, window, cx);
+                            cx.stop_propagation();
+                        }
+                        Ok(None) => cx.propagate(),
+                        Err(error) => {
+                            this.error = Some(error.to_string());
+                            this.fit(window);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
                     native::hide_panel(window);
@@ -1193,6 +1450,10 @@ impl Render for QuickAsk {
                     .text_color(muted)
                     .child(self.status.clone()),
             );
+        }
+
+        if self.draft_images.loading || !self.draft_images.images.is_empty() {
+            body = body.child(self.draft_images_view(cx));
         }
 
         let send = div()
