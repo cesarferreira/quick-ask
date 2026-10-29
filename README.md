@@ -1,10 +1,16 @@
 # Quick Ask
 
-A small native macOS chat panel for quick questions. Written in Rust with GPUI,
-rendered with Metal, and kept in the menu bar. Press **Option+Space**, type a
-question, and press **Enter**. The panel expands as the answer streams in.
+I missed the old ChatGPT app. I just wanted to hit **Option+Space**, ask a quick
+question, and get back to what I was doing. So I made Quick Ask.
+
+It's a small native macOS app that uses your existing **ChatGPT subscription**.
+Sign in with your ChatGPT account, pick a model, and start chatting. No API key
+needed.
 
 ![Quick Ask floating over the macOS desktop wallpaper](docs/images/quick-ask.png)
+
+Written in Rust with GPUI, rendered with Metal, and kept in the menu bar. The panel
+expands as the answer streams in.
 
 On macOS 26 and newer, the panel uses AppKit's native `NSGlassEffectView` with
 system appearance, a compact icon toolbar, and content-sized answers. Older
