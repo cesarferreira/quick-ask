@@ -29,6 +29,16 @@ use std::{
 actions!(quick_ask, [Dismiss, NewChat, ShowHistory, CopyAnswer, Quit]);
 const ACCENT: u32 = 0x0a84ff;
 const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
+const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
+
+/// The copy button that last wrote to the clipboard; it shows a check until the feedback expires.
+#[derive(Default)]
+struct CopiedButton {
+    id: Option<ElementId>,
+    generation: u64,
+}
+
+impl Global for CopiedButton {}
 
 enum Event {
     Status(u64, String),
@@ -746,7 +756,7 @@ impl QuickAsk {
                 .map(|m| m.content.clone())
         };
         if let Some(text) = text {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            copy_to_clipboard("copy".into(), text, cx);
         }
     }
 
@@ -1013,11 +1023,49 @@ fn icon_button(id: impl Into<ElementId>, icon: IconName, label: &'static str) ->
         .child(Icon::new(icon).size(px(15.)))
 }
 
-fn copy_button(id: impl Into<ElementId>, text: SharedString, label: &'static str) -> Stateful<Div> {
-    icon_button(id, IconName::Copy, label)
+fn copy_to_clipboard(id: ElementId, text: String, cx: &mut App) {
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    let copied = cx.default_global::<CopiedButton>();
+    copied.generation += 1;
+    copied.id = Some(id);
+    let generation = copied.generation;
+    cx.refresh_windows();
+    cx.spawn(async move |cx| {
+        Timer::after(COPIED_FEEDBACK).await;
+        cx.update(|cx| {
+            let copied = cx.default_global::<CopiedButton>();
+            if copied.generation == generation {
+                copied.id = None;
+                cx.refresh_windows();
+            }
+        })
+        .ok();
+    })
+    .detach();
+}
+
+fn copy_icon(id: &ElementId, cx: &App) -> IconName {
+    let copied = cx
+        .try_global::<CopiedButton>()
+        .is_some_and(|copied| copied.id.as_ref() == Some(id));
+    if copied {
+        IconName::Check
+    } else {
+        IconName::Copy
+    }
+}
+
+fn copy_button(
+    id: impl Into<ElementId>,
+    text: SharedString,
+    label: &'static str,
+    cx: &App,
+) -> Stateful<Div> {
+    let id = id.into();
+    icon_button(id.clone(), copy_icon(&id, cx), label)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, _, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+            copy_to_clipboard(id.clone(), text.to_string(), cx);
             cx.stop_propagation();
         })
 }
@@ -1122,9 +1170,10 @@ fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut A
                 )
                 .child(
                     copy_button(
-                        "copy-question",
+                        ("copy-question", index),
                         message.content.clone().into(),
                         "Copy question",
+                        cx,
                     )
                     .text_color(cx.theme().muted_foreground),
                 );
@@ -1147,7 +1196,7 @@ fn markdown_view(
         .code_block_actions(|block, _, cx| {
             let code = block.code();
             // Distinct owned code allocations keep sibling copy buttons independent.
-            copy_button(("copy-code", code.as_ptr() as usize), code, "Copy code")
+            copy_button(("copy-code", code.as_ptr() as usize), code, "Copy code", cx)
                 .text_color(cx.theme().muted_foreground)
         })
 }
@@ -1186,9 +1235,10 @@ fn answer_view(
                             .child(
                                 div().absolute().top_2().right_2().child(
                                     copy_button(
-                                        "copy-live-code",
+                                        ("copy-live-code", block.start),
                                         body.to_owned().into(),
                                         "Copy code",
+                                        cx,
                                     )
                                     .text_color(cx.theme().muted_foreground),
                                 ),
@@ -1216,8 +1266,13 @@ fn answer_view(
     answer
         .child(
             div().child(
-                copy_button("copy-response", text, "Copy response as Markdown")
-                    .text_color(cx.theme().muted_foreground),
+                copy_button(
+                    ("copy-response", index),
+                    text,
+                    "Copy response as Markdown",
+                    cx,
+                )
+                .text_color(cx.theme().muted_foreground),
             ),
         )
         .into_any_element()
@@ -1595,7 +1650,7 @@ impl Render for QuickAsk {
         }
         if expanded {
             controls = controls.child(
-                icon_button("copy", IconName::Copy, "Copy answer · ⌘⇧C")
+                icon_button("copy", copy_icon(&"copy".into(), cx), "Copy answer · ⌘⇧C")
                     .on_click(cx.listener(|this, _, _, cx| this.copy_answer(cx))),
             );
         }
