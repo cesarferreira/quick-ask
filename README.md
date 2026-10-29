@@ -165,6 +165,12 @@ xcrun swift scripts/generate-icon.swift scripts/icons
 
 For a faster bundle during development, run `./scripts/package.sh --debug`.
 
+To install, run `make install`. It packages the app, quits any running
+instance, copies `Quick Ask.app` to `/Applications`, and opens it. Set
+`INSTALL_DIR` to install somewhere else, for example
+`make install INSTALL_DIR=~/Applications`. Run `make clean` to remove the Cargo
+build output and `dist/`.
+
 Protocol and storage tests use local fixtures. They do not substitute for a real
 ChatGPT sign-in and live request. Chat with inline images and local history are
 supported; uploads, voice, web tools, and ChatGPT memory are not implemented.
