@@ -41,6 +41,11 @@ to fit within a 4096-pixel longest edge and 8 MiB per attachment; animated input
 use a still frame. Images are copied into private local storage alongside your
 chat history, so moving the original file does not break later questions.
 
+Click an attached image, or an image on its own line in an answer, to expand it
+in the panel. Use the download button to save it to your Downloads folder; an
+existing file is never replaced. Press **Esc** or **Back** to close it. Images
+placed inside a line of text are not expandable.
+
 The app has been tested with browser sign-in, Keychain credential persistence,
 the account's live model catalog, and a real subscription-backed reply.
 This first version keeps one saved account registration; an account picker is

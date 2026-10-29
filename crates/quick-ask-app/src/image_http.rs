@@ -23,6 +23,9 @@ const MAX_IMAGE_PIXELS: u64 = 16_000_000;
 const MAX_ANIMATION_PIXELS: u64 = 24_000_000;
 const MAX_ANIMATION_FRAMES: u64 = 120;
 
+pub const DOWNLOAD_ICON_PATH: &str = "icons/download.svg";
+const DOWNLOAD_ICON: &[u8] = include_bytes!("../assets/icons/download.svg");
+
 pub struct ImageAssets;
 
 impl gpui::AssetSource for ImageAssets {
@@ -30,6 +33,8 @@ impl gpui::AssetSource for ImageAssets {
         if is_data_uri(path) {
             let (_, bytes) = decode_data_image(path)?;
             Ok(Some(Cow::Owned(bytes)))
+        } else if path == DOWNLOAD_ICON_PATH {
+            Ok(Some(Cow::Borrowed(DOWNLOAD_ICON)))
         } else {
             gpui_component_assets::Assets.load(path)
         }
@@ -202,12 +207,12 @@ fn validate_redirect(source: &Url, destination: &Url) -> Result<()> {
     Ok(())
 }
 
-fn is_data_uri(uri: &str) -> bool {
+pub fn is_data_uri(uri: &str) -> bool {
     uri.get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
 }
 
-fn decode_data_image(uri: &str) -> Result<(&'static str, Vec<u8>)> {
+pub fn decode_data_image(uri: &str) -> Result<(&'static str, Vec<u8>)> {
     let (metadata, encoded) = uri[5..].split_once(',').context("invalid image data URL")?;
     let mime = match metadata.to_ascii_lowercase().as_str() {
         "image/png;base64" => "image/png",

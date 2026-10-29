@@ -1,7 +1,15 @@
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockKind<'a> {
     Markdown,
-    Code { language: &'a str, body: &'a str },
+    Code {
+        language: &'a str,
+        body: &'a str,
+    },
+    /// A paragraph holding only `![alt](url)`, rendered as its own interactive image.
+    Image {
+        alt: &'a str,
+        url: &'a str,
+    },
 }
 
 #[derive(Debug)]
@@ -40,7 +48,7 @@ pub fn blocks(text: &str) -> Vec<Block<'_>> {
                     start,
                     source: &text[start..position],
                     complete: true,
-                    kind: BlockKind::Markdown,
+                    kind: paragraph_kind(&text[start..position]),
                 });
             }
             start = position;
@@ -51,7 +59,7 @@ pub fn blocks(text: &str) -> Vec<Block<'_>> {
                     start,
                     source: &text[start..end],
                     complete: true,
-                    kind: BlockKind::Markdown,
+                    kind: paragraph_kind(&text[start..end]),
                 });
             }
             start = end;
@@ -73,10 +81,49 @@ pub fn blocks(text: &str) -> Vec<Block<'_>> {
             start,
             source: &text[start..],
             complete: false,
-            kind: BlockKind::Markdown,
+            kind: paragraph_kind(&text[start..]),
         });
     }
     blocks
+}
+
+fn paragraph_kind(source: &str) -> BlockKind<'_> {
+    // Four spaces or a tab start an indented code block, not a paragraph.
+    if source.starts_with("    ") || source.starts_with('\t') {
+        return BlockKind::Markdown;
+    }
+    standalone_image(source.trim())
+        .map(|(alt, url)| BlockKind::Image { alt, url })
+        .unwrap_or(BlockKind::Markdown)
+}
+
+/// Parses `![alt](url)` or `![alt](url "title")` when it is the whole paragraph.
+fn standalone_image(source: &str) -> Option<(&str, &str)> {
+    if source.contains('\n') {
+        return None;
+    }
+    let rest = source.strip_prefix("![")?;
+    let (alt, rest) = rest.split_once("](")?;
+    if alt.contains(['[', ']']) {
+        return None;
+    }
+    let target = rest.strip_suffix(')')?.trim();
+    let (url, title) = match target.strip_prefix('<') {
+        Some(target) => target.split_once('>')?,
+        None => target
+            .split_once(char::is_whitespace)
+            .unwrap_or((target, "")),
+    };
+    let title = title.trim();
+    let quoted =
+        |open, close| title.len() >= 2 && title.starts_with(open) && title.ends_with(close);
+    if url.is_empty()
+        || url.contains(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '<' | '>'))
+        || !(title.is_empty() || quoted('"', '"') || quoted('\'', '\''))
+    {
+        return None;
+    }
+    Some((alt, url))
 }
 
 fn fence_line(line: &str) -> Option<(u8, usize, &str)> {
@@ -141,6 +188,44 @@ mod tests {
         assert!(parsed[0].complete);
         assert_eq!(parsed[0].source, "~~~~rust\nlet n = 1;\n~~~\n\n~~~~\n");
         assert_eq!(parsed[1].source, "After");
+    }
+
+    #[test]
+    fn standalone_image_paragraphs_become_image_blocks() {
+        let parsed = blocks(
+            "Look:\n\n![A cat](https://example.com/cat.png \"Cat\")\n\n![](data:image/png;base64,AAAA)",
+        );
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].kind, BlockKind::Markdown);
+        assert_eq!(
+            parsed[1].kind,
+            BlockKind::Image {
+                alt: "A cat",
+                url: "https://example.com/cat.png"
+            }
+        );
+        assert_eq!(parsed[2].start, 52);
+        assert_eq!(
+            parsed[2].kind,
+            BlockKind::Image {
+                alt: "",
+                url: "data:image/png;base64,AAAA"
+            }
+        );
+    }
+
+    #[test]
+    fn images_mixed_with_text_or_links_stay_markdown() {
+        for source in [
+            "See ![a](https://example.com/a.png) here",
+            "[![a](https://example.com/a.png)](https://example.com)",
+            "![a](https://example.com/a.png) and ![b](https://example.com/b.png)",
+            "![a](https://example.com/a.png\n)",
+            "![a](https://example.com/a.png",
+            "    ![a](https://example.com/a.png)",
+        ] {
+            assert_eq!(blocks(source)[0].kind, BlockKind::Markdown, "{source}");
+        }
     }
 
     #[test]

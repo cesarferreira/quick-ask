@@ -1,13 +1,15 @@
 use crate::{
     attachments::AttachmentStore,
+    downloads,
     draft_images::DraftImages,
+    image_http,
     live_markdown::{self, BlockKind},
     native::{self, NativeEvent, NativeShell},
     turn::Turn,
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Theme, ThemeMode,
+    ActiveTheme, Icon, IconName, IconNamed, Theme, ThemeMode,
     input::{Input, InputEvent, InputState},
     text::{TextView, TextViewStyle},
 };
@@ -29,16 +31,67 @@ use std::{
 actions!(quick_ask, [Dismiss, NewChat, ShowHistory, CopyAnswer, Quit]);
 const ACCENT: u32 = 0x0a84ff;
 const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
-const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
+const DONE_FEEDBACK: Duration = Duration::from_millis(1500);
 
-/// The copy button that last wrote to the clipboard; it shows a check until the feedback expires.
+/// The button that last finished a copy or download; it shows a check until the feedback expires.
 #[derive(Default)]
-struct CopiedButton {
+struct DoneButton {
     id: Option<ElementId>,
     generation: u64,
 }
 
-impl Global for CopiedButton {}
+impl Global for DoneButton {}
+
+struct DownloadIcon;
+
+impl IconNamed for DownloadIcon {
+    fn path(self) -> SharedString {
+        image_http::DOWNLOAD_ICON_PATH.into()
+    }
+}
+
+/// An uploaded or rendered image shown full size in the panel.
+#[derive(Clone)]
+struct PreviewImage {
+    name: String,
+    source: PreviewSource,
+}
+
+#[derive(Clone)]
+enum PreviewSource {
+    Local(PathBuf),
+    Remote(SharedString),
+}
+
+impl PreviewImage {
+    fn local(image: &ImageAttachment) -> Self {
+        Self {
+            name: image.name.clone(),
+            source: PreviewSource::Local(image.path.clone()),
+        }
+    }
+
+    fn remote(url: &str, alt: &str) -> Self {
+        let name = if !alt.trim().is_empty() {
+            alt.trim().to_owned()
+        } else if image_http::is_data_uri(url) {
+            "Image".into()
+        } else {
+            url.to_owned()
+        };
+        Self {
+            name,
+            source: PreviewSource::Remote(url.to_owned().into()),
+        }
+    }
+
+    fn element(&self) -> Img {
+        match &self.source {
+            PreviewSource::Local(path) => img(path.clone()),
+            PreviewSource::Remote(url) => img(url.clone()),
+        }
+    }
+}
 
 enum Event {
     Status(u64, String),
@@ -81,6 +134,7 @@ pub struct QuickAsk {
     image_store: AttachmentStore,
     draft_images: DraftImages,
     turn_images: Vec<ImageAttachment>,
+    preview: Option<PreviewImage>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -150,6 +204,7 @@ impl QuickAsk {
         for image in &self.draft_images.images {
             let path = image.path.clone();
             let name = image.name.clone();
+            let preview = PreviewImage::local(image);
             row = row.child(
                 div()
                     .id(SharedString::from(format!("draft-{}", path.display())))
@@ -159,9 +214,13 @@ impl QuickAsk {
                     .rounded_lg()
                     .overflow_hidden()
                     .bg(rgba(0x80808025))
+                    .cursor_pointer()
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(name.clone()).build(window, cx)
                     })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_preview(preview.clone(), window, cx);
+                    }))
                     .child(img(path.clone()).size_full().object_fit(ObjectFit::Cover))
                     .child(
                         div()
@@ -179,6 +238,7 @@ impl QuickAsk {
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(0x0a84ff)))
                             .child(Icon::new(IconName::Close).size(px(12.)))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.draft_images.remove(&path);
                                 this.fit(window);
@@ -340,6 +400,7 @@ impl QuickAsk {
             image_store,
             draft_images: DraftImages::default(),
             turn_images: vec![],
+            preview: None,
             _subscriptions: vec![subscription, activation, appearance, bounds],
         };
         this.fit(window);
@@ -448,6 +509,7 @@ impl QuickAsk {
         self.history_open = false;
         self.models_open = false;
         self.settings_open = false;
+        self.preview = None;
         self.error = None;
         self.status.clear();
         let model = self.models[self.selected_model].id.clone();
@@ -516,6 +578,7 @@ impl QuickAsk {
         self.history_open = false;
         self.models_open = false;
         self.settings_open = false;
+        self.preview = None;
         self.error = None;
         self.status.clear();
         self.input.update(cx, |input, cx| {
@@ -536,7 +599,9 @@ impl QuickAsk {
         } else {
             0.
         };
-        let height = if self.settings_open {
+        let height = if self.preview.is_some() {
+            580.
+        } else if self.settings_open {
             280. + extra
         } else if self.history_open {
             (180. + self.conversations.len().max(1) as f32 * 64.).min(540.)
@@ -760,6 +825,76 @@ impl QuickAsk {
         }
     }
 
+    fn open_preview(&mut self, image: PreviewImage, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_open = false;
+        self.models_open = false;
+        self.settings_open = false;
+        self.preview = Some(image);
+        self.fit(window);
+        cx.notify();
+    }
+
+    fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = None;
+        self.fit(window);
+        cx.notify();
+    }
+
+    fn download_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview.clone() else {
+            return;
+        };
+        let Some(directory) = dirs::download_dir() else {
+            self.error = Some("Could not find your Downloads folder.".into());
+            cx.notify();
+            return;
+        };
+        let http = cx.http_client();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let saved = async {
+                let bytes = match preview.source {
+                    PreviewSource::Local(path) => {
+                        executor.spawn(async move { std::fs::read(path) }).await?
+                    }
+                    PreviewSource::Remote(url) if image_http::is_data_uri(&url) => {
+                        image_http::decode_data_image(&url)?.1
+                    }
+                    PreviewSource::Remote(url) => {
+                        let response = http
+                            .get(&url, gpui::http_client::AsyncBody::empty(), true)
+                            .await?;
+                        anyhow::ensure!(
+                            response.status().is_success(),
+                            "the server returned {}",
+                            response.status()
+                        );
+                        let mut bytes = Vec::new();
+                        futures_lite::AsyncReadExt::read_to_end(
+                            &mut response.into_body(),
+                            &mut bytes,
+                        )
+                        .await?;
+                        bytes
+                    }
+                };
+                executor
+                    .spawn(async move { downloads::save_image(&directory, &preview.name, &bytes) })
+                    .await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                match saved {
+                    Ok(_) => mark_done("download-image".into(), cx),
+                    Err(error) => this.error = Some(format!("Could not save the image: {error:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn sign_out(&mut self, cx: &mut Context<Self>) {
         if self.auth_busy {
             return;
@@ -768,6 +903,7 @@ impl QuickAsk {
         self.turn.reset();
         self.draft_images.clear();
         self.turn_images.clear();
+        self.preview = None;
         self.auth_busy = true;
         self.auth_can_cancel = false;
         let auth = self.auth.clone();
@@ -928,6 +1064,7 @@ impl QuickAsk {
     fn transcript(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let scroll = self.scroll.clone();
         let follow = self.follow_reply;
+        let view = cx.entity();
         let mut list = div()
             .on_children_prepainted(move |_, window, _| {
                 if follow && scroll.max_offset().height + scroll.offset().y > px(1.) {
@@ -962,7 +1099,7 @@ impl QuickAsk {
             .px_5()
             .py_4();
         for (index, message) in self.conversation.messages.iter().enumerate() {
-            list = list.child(message_view(index, message, window, cx));
+            list = list.child(message_view(index, message, &view, window, cx));
         }
         if let Some(prompt) = &self.turn.prompt {
             list = list.child(message_view(
@@ -972,6 +1109,7 @@ impl QuickAsk {
                     content: prompt.clone(),
                     images: self.turn_images.clone(),
                 },
+                &view,
                 window,
                 cx,
             ));
@@ -980,6 +1118,7 @@ impl QuickAsk {
                     self.conversation.messages.len() + 1,
                     self.turn.visible_text(),
                     Some(self.turn.id),
+                    &view,
                     window,
                     cx,
                 ));
@@ -1009,7 +1148,11 @@ fn pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Di
         .child(label.into())
 }
 
-fn icon_button(id: impl Into<ElementId>, icon: IconName, label: &'static str) -> Stateful<Div> {
+fn icon_button(
+    id: impl Into<ElementId>,
+    icon: impl Into<Icon>,
+    label: &'static str,
+) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(28.))
@@ -1025,17 +1168,21 @@ fn icon_button(id: impl Into<ElementId>, icon: IconName, label: &'static str) ->
 
 fn copy_to_clipboard(id: ElementId, text: String, cx: &mut App) {
     cx.write_to_clipboard(ClipboardItem::new_string(text));
-    let copied = cx.default_global::<CopiedButton>();
-    copied.generation += 1;
-    copied.id = Some(id);
-    let generation = copied.generation;
+    mark_done(id, cx);
+}
+
+fn mark_done(id: ElementId, cx: &mut App) {
+    let done = cx.default_global::<DoneButton>();
+    done.generation += 1;
+    done.id = Some(id);
+    let generation = done.generation;
     cx.refresh_windows();
     cx.spawn(async move |cx| {
-        Timer::after(COPIED_FEEDBACK).await;
+        Timer::after(DONE_FEEDBACK).await;
         cx.update(|cx| {
-            let copied = cx.default_global::<CopiedButton>();
-            if copied.generation == generation {
-                copied.id = None;
+            let done = cx.default_global::<DoneButton>();
+            if done.generation == generation {
+                done.id = None;
                 cx.refresh_windows();
             }
         })
@@ -1044,14 +1191,15 @@ fn copy_to_clipboard(id: ElementId, text: String, cx: &mut App) {
     .detach();
 }
 
-fn copy_icon(id: &ElementId, cx: &App) -> IconName {
-    let copied = cx
-        .try_global::<CopiedButton>()
-        .is_some_and(|copied| copied.id.as_ref() == Some(id));
-    if copied {
-        IconName::Check
+/// Shows a check in place of `icon` while the button's action has just finished.
+fn done_icon(id: &ElementId, icon: impl Into<Icon>, cx: &App) -> Icon {
+    let done = cx
+        .try_global::<DoneButton>()
+        .is_some_and(|done| done.id.as_ref() == Some(id));
+    if done {
+        IconName::Check.into()
     } else {
-        IconName::Copy
+        icon.into()
     }
 }
 
@@ -1062,7 +1210,7 @@ fn copy_button(
     cx: &App,
 ) -> Stateful<Div> {
     let id = id.into();
-    icon_button(id.clone(), copy_icon(&id, cx), label)
+    icon_button(id.clone(), done_icon(&id, IconName::Copy, cx), label)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(move |_, _, cx| {
             copy_to_clipboard(id.clone(), text.to_string(), cx);
@@ -1112,7 +1260,13 @@ fn activity_indicator(label: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut App) -> AnyElement {
+fn message_view(
+    index: usize,
+    message: &Message,
+    view: &Entity<QuickAsk>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     if message.role == "user" {
         let mut question = div()
             .id(("question", index))
@@ -1135,8 +1289,16 @@ fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut A
                             .enumerate()
                             .map(|(image_index, image)| {
                                 let name = image.name.clone();
+                                let preview = PreviewImage::local(image);
+                                let view = view.clone();
                                 div()
                                     .id(("question-image", image_index))
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.open_preview(preview.clone(), window, cx)
+                                        });
+                                    })
                                     .w(px(156.))
                                     .h(px(104.))
                                     .rounded_lg()
@@ -1180,7 +1342,7 @@ fn message_view(index: usize, message: &Message, window: &mut Window, cx: &mut A
         }
         question.into_any_element()
     } else {
-        answer_view(index, &message.content, None, window, cx)
+        answer_view(index, &message.content, None, view, window, cx)
     }
 }
 
@@ -1205,6 +1367,7 @@ fn answer_view(
     index: usize,
     text: &str,
     live_turn: Option<u64>,
+    view: &Entity<QuickAsk>,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -1258,10 +1421,38 @@ fn answer_view(
                         cx,
                     ));
                 }
+                BlockKind::Image { alt, url } => {
+                    answer = answer.child(answer_image(block.start, alt, url, view));
+                }
             }
         }
     } else {
-        answer = answer.child(markdown_view(("answer", index), text.clone(), window, cx));
+        // Keep text between images in one view so selection spans paragraphs.
+        let mut markdown_start = 0;
+        for block in live_markdown::blocks(&text) {
+            if let BlockKind::Image { alt, url } = block.kind {
+                let markdown = &text[markdown_start..block.start];
+                if !markdown.trim().is_empty() {
+                    answer = answer.child(markdown_view(
+                        SharedString::from(format!("answer-{index}-{markdown_start}")),
+                        markdown.to_owned().into(),
+                        window,
+                        cx,
+                    ));
+                }
+                answer = answer.child(answer_image(block.start, alt, url, view));
+                markdown_start = block.start + block.source.len();
+            }
+        }
+        let markdown = &text[markdown_start..];
+        if !markdown.trim().is_empty() {
+            answer = answer.child(markdown_view(
+                SharedString::from(format!("answer-{index}-{markdown_start}")),
+                markdown.to_owned().into(),
+                window,
+                cx,
+            ));
+        }
     }
     answer
         .child(
@@ -1278,10 +1469,30 @@ fn answer_view(
         .into_any_element()
 }
 
+fn answer_image(start: usize, alt: &str, url: &str, view: &Entity<QuickAsk>) -> AnyElement {
+    let preview = PreviewImage::remote(url, alt);
+    let view = view.clone();
+    div()
+        .id(("answer-image", start))
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.open_preview(preview.clone(), window, cx)
+            });
+        })
+        .child(
+            img(SharedString::from(url.to_owned()))
+                .object_fit(ObjectFit::Contain)
+                .max_w(relative(1.)),
+        )
+        .into_any_element()
+}
+
 impl Render for QuickAsk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let expanded = !self.conversation.messages.is_empty() || self.turn.prompt.is_some();
-        let has_section = self.history_open || self.models_open || self.settings_open;
+        let has_section =
+            self.history_open || self.models_open || self.settings_open || self.preview.is_some();
         let signed_in = self.account.is_some();
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -1325,9 +1536,13 @@ impl Render for QuickAsk {
                     }
                 }),
             )
-            .capture_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" {
-                    native::hide_panel(window);
+                    if this.preview.is_some() {
+                        this.close_preview(window, cx);
+                    } else {
+                        native::hide_panel(window);
+                    }
                     cx.stop_propagation();
                 }
             }))
@@ -1337,6 +1552,7 @@ impl Render for QuickAsk {
                 this.history_open = !this.history_open;
                 this.models_open = false;
                 this.settings_open = false;
+                this.preview = None;
                 this.fit(window);
                 cx.notify();
             }))
@@ -1350,14 +1566,16 @@ impl Render for QuickAsk {
             );
 
         if expanded || has_section {
-            let title = if self.history_open {
-                "Chats"
+            let title: SharedString = if self.history_open {
+                "Chats".into()
             } else if self.models_open {
-                "Model & reasoning"
+                "Model & reasoning".into()
             } else if self.settings_open {
-                "Account"
+                "Account".into()
+            } else if let Some(preview) = &self.preview {
+                SharedString::from(preview.name.clone())
             } else {
-                "Quick Ask"
+                "Quick Ask".into()
             };
             body = body.child(
                 div()
@@ -1368,8 +1586,11 @@ impl Render for QuickAsk {
                     .px_4()
                     .pt_3()
                     .pb_2()
+                    .gap_2()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -1380,6 +1601,7 @@ impl Render for QuickAsk {
                                             this.history_open = false;
                                             this.models_open = false;
                                             this.settings_open = false;
+                                            this.preview = None;
                                             this.fit(window);
                                             cx.notify();
                                         }),
@@ -1391,13 +1613,33 @@ impl Render for QuickAsk {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(muted)
+                                    .min_w_0()
+                                    .truncate()
                                     .child(title),
                             ),
                     )
                     .child(
-                        icon_button("dismiss", IconName::Close, "Dismiss · Esc")
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_color(muted)
-                            .on_click(|_, window, _| native::hide_panel(window)),
+                            .when(self.preview.is_some(), |s| {
+                                s.child(
+                                    icon_button(
+                                        "download-image",
+                                        done_icon(&"download-image".into(), DownloadIcon, cx),
+                                        "Save to Downloads",
+                                    )
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.download_preview(cx)),
+                                    ),
+                                )
+                            })
+                            .child(
+                                icon_button("dismiss", IconName::Close, "Dismiss · Esc")
+                                    .on_click(|_, window, _| native::hide_panel(window)),
+                            ),
                     ),
             );
         }
@@ -1453,6 +1695,16 @@ impl Render for QuickAsk {
             body = body.child(self.models_view(cx));
         } else if self.history_open {
             body = body.child(self.history_view(cx));
+        } else if let Some(preview) = &self.preview {
+            body = body.child(
+                div()
+                    .id("image-preview")
+                    .flex_1()
+                    .min_h_0()
+                    .px_5()
+                    .pb_3()
+                    .child(preview.element().size_full().object_fit(ObjectFit::Contain)),
+            );
         } else if expanded {
             body = body.child(self.transcript(window, cx));
             if !self.follow_reply {
@@ -1585,6 +1837,7 @@ impl Render for QuickAsk {
                             this.models_open = !this.models_open;
                             this.history_open = false;
                             this.settings_open = false;
+                            this.preview = None;
                             this.fit(window);
                             cx.notify();
                         }
@@ -1604,6 +1857,7 @@ impl Render for QuickAsk {
                                 this.models_open = !this.models_open;
                                 this.history_open = false;
                                 this.settings_open = false;
+                                this.preview = None;
                                 this.fit(window);
                                 cx.notify();
                             }
@@ -1650,8 +1904,12 @@ impl Render for QuickAsk {
         }
         if expanded {
             controls = controls.child(
-                icon_button("copy", copy_icon(&"copy".into(), cx), "Copy answer · ⌘⇧C")
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_answer(cx))),
+                icon_button(
+                    "copy",
+                    done_icon(&"copy".into(), IconName::Copy, cx),
+                    "Copy answer · ⌘⇧C",
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.copy_answer(cx))),
             );
         }
         controls = controls
@@ -1661,6 +1919,7 @@ impl Render for QuickAsk {
                         this.history_open = !this.history_open;
                         this.models_open = false;
                         this.settings_open = false;
+                        this.preview = None;
                         this.fit(window);
                         cx.notify();
                     }),
@@ -1674,6 +1933,7 @@ impl Render for QuickAsk {
                 icon_button("settings", IconName::Ellipsis, "Account and usage").on_click(
                     cx.listener(|this, _, window, cx| {
                         this.settings_open = !this.settings_open;
+                        this.preview = None;
                         this.history_open = false;
                         this.models_open = false;
                         this.fit(window);

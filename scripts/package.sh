@@ -47,6 +47,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
     <key>LSUIElement</key><true/>
+    <key>NSDownloadsFolderUsageDescription</key><string>Quick Ask saves images you download to this folder.</string>
     <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>

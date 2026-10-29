@@ -11,6 +11,7 @@ anyhow.workspace = true
 reqwest.workspace = true
 base64 = "0.22"
 futures-channel = "0.3"
+futures-lite = "2"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 sha2 = "0.10"
 gif = "=0.14.2"
@@ -29,5 +30,3 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplic
 objc2-foundation = "0.3"
 objc2-quartz-core = { version = "0.3", features = ["CALayer"] }
 
-[dev-dependencies]
-futures-lite = "2"
