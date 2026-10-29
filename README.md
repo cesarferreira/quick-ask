@@ -4,6 +4,8 @@ A small native macOS chat panel for quick questions. Written in Rust with GPUI,
 rendered with Metal, and kept in the menu bar. Press **Option+Space**, type a
 question, and press **Enter**. The panel expands as the answer streams in.
 
+![Quick Ask floating over the macOS desktop wallpaper](docs/images/quick-ask.png)
+
 On macOS 26 and newer, the panel uses AppKit's native `NSGlassEffectView` with
 system appearance, a compact icon toolbar, and content-sized answers. Older
 systems fall back to macOS vibrancy.
