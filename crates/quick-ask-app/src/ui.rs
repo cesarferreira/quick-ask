@@ -272,6 +272,7 @@ impl QuickAsk {
                 Some("QuickAsk && Input"),
             ),
         ]);
+        Theme::global_mut(cx).caret = rgb(ACCENT).into();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Ask anything…")
@@ -281,11 +282,15 @@ impl QuickAsk {
             if matches!(event, InputEvent::PressEnter { secondary: false }) {
                 this.send(window, cx);
             }
-            if matches!(event, InputEvent::Change) {
+            if matches!(
+                event,
+                InputEvent::Change | InputEvent::Focus | InputEvent::Blur
+            ) {
                 cx.notify();
             }
         });
         let activation = cx.observe_window_activation(window, |_, window, cx| {
+            cx.notify();
             if !window.is_window_active() && native::panel_visible(window) {
                 cx.spawn_in(window, async move |this, cx| {
                     loop {
@@ -325,6 +330,7 @@ impl QuickAsk {
             Theme::change(ThemeMode::from(window.appearance()), Some(window), cx);
             Theme::global_mut(cx).background = transparent_black();
             Theme::global_mut(cx).font_size = px(14.);
+            Theme::global_mut(cx).caret = rgb(ACCENT).into();
             Theme::global_mut(cx).muted_foreground = if Theme::global(cx).mode.is_dark() {
                 rgb(0xb6b6c0).into()
             } else {
@@ -1464,6 +1470,10 @@ impl Render for QuickAsk {
         let has_section =
             self.history_open || self.models_open || self.settings_open || self.preview.is_some();
         let signed_in = self.account.is_some();
+        let input_focused = signed_in
+            && !self.auth_busy
+            && window.is_window_active()
+            && self.input.read(cx).focus_handle(cx).is_focused(window);
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let glass_tint = if cx.theme().mode.is_dark() {
@@ -1496,7 +1506,7 @@ impl Render for QuickAsk {
                             .unwrap_or_default();
                         height += content + window.rem_size() * 2. - scroll.bounds().size.height;
                     }
-                    let minimum = px(if signed_in { 132. } else { 156. });
+                    let minimum = px(if signed_in { 112. } else { 156. });
                     let target = size(px(620.), height.ceil().clamp(minimum, px(620.)));
                     if window.bounds().size != target {
                         window.defer(cx, move |window, _| window.resize(target));
@@ -1752,8 +1762,36 @@ impl Render for QuickAsk {
             );
         }
 
+        let mut composer = div()
+            .id("composer")
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .when(expanded, |composer| {
+                composer
+                    .rounded(px(14.))
+                    .border_1()
+                    .border_color(if cx.theme().mode.is_dark() {
+                        rgba(0xb6b6c080)
+                    } else {
+                        rgba(0x8e8e934d)
+                    })
+                    .bg(if cx.theme().mode.is_dark() {
+                        rgba(0x202226cc)
+                    } else {
+                        rgba(0xffffff70)
+                    })
+            })
+            .when(expanded && input_focused, |composer| {
+                composer.border_color(rgb(0x369dff)).shadow(vec![BoxShadow {
+                    color: rgba(0x0a84ff1c).into(),
+                    offset: point(px(0.), px(0.)),
+                    blur_radius: px(12.),
+                    spread_radius: px(1.),
+                }])
+            });
         if self.draft_images.loading || !self.draft_images.images.is_empty() {
-            body = body.child(self.draft_images_view(cx));
+            composer = composer.child(self.draft_images_view(cx));
         }
 
         let send = div()
@@ -1792,20 +1830,20 @@ impl Render for QuickAsk {
                     this.send(window, cx);
                 }
             }));
-        body = body.child(
+        composer = composer.child(
             div()
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .gap_3()
-                .px_5()
+                .px_4()
                 .pt_3()
                 .pb_2()
                 .child(
                     div().flex_1().min_w_0().child(
                         Input::new(&self.input)
                             .appearance(false)
-                            .text_size(px(if expanded { 16. } else { 22. }))
+                            .text_size(px(16.))
                             .disabled(!signed_in || self.auth_busy),
                     ),
                 )
@@ -1839,23 +1877,32 @@ impl Render for QuickAsk {
             if let Some(effort) =
                 self.models[self.selected_model].resolve_effort(self.conversation.reasoning_effort)
             {
-                left = left.child(
-                    pill("reasoning-effort", effort.label())
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(Icon::new(IconName::ChevronDown).size(px(11.)))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if !this.turn.busy {
-                                this.models_open = !this.models_open;
-                                this.history_open = false;
-                                this.settings_open = false;
-                                this.preview = None;
-                                this.fit(window);
-                                cx.notify();
-                            }
-                        })),
-                );
+                left = left
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(1.))
+                            .h(px(14.))
+                            .mx_2()
+                            .bg(rgba(0x80808040)),
+                    )
+                    .child(
+                        pill("reasoning-effort", effort.label())
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(Icon::new(IconName::ChevronDown).size(px(11.)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if !this.turn.busy {
+                                    this.models_open = !this.models_open;
+                                    this.history_open = false;
+                                    this.settings_open = false;
+                                    this.preview = None;
+                                    this.fit(window);
+                                    cx.notify();
+                                }
+                            })),
+                    );
             }
         } else {
             left = left.child(div().text_size(px(12.)).child("Quick Ask"));
@@ -1934,19 +1981,20 @@ impl Render for QuickAsk {
                     }),
                 ),
             );
-        body = body.child(
+        composer = composer.child(
             div()
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .px_5()
+                .px_4()
                 .pb_3()
                 .child(left)
                 .child(drag_surface("toolbar-drag-space").flex_1().h(px(28.)))
                 .child(controls),
         );
+        body = body.child(div().flex_shrink_0().px_3().pb_3().child(composer));
         if !signed_in && !self.auth_busy {
             body = body.child(
                 div()
