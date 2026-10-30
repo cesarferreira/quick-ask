@@ -104,7 +104,6 @@ enum Event {
 
 pub struct QuickAsk {
     input: Entity<InputState>,
-    composer_expanded: bool,
     auth: Arc<Mutex<AuthManager>>,
     account: Option<AccountSummary>,
     auth_busy: bool,
@@ -283,9 +282,7 @@ impl QuickAsk {
                 this.send(window, cx);
             }
             if matches!(event, InputEvent::Change) {
-                let text = this.input.read(cx).value();
-                this.composer_expanded = text.contains('\n') || text.chars().count() > 50;
-                this.fit(window);
+                cx.notify();
             }
         });
         let activation = cx.observe_window_activation(window, |_, window, cx| {
@@ -370,7 +367,6 @@ impl QuickAsk {
         let has_account = account.is_some();
         let mut this = Self {
             input,
-            composer_expanded: false,
             auth,
             account,
             auth_busy: false,
@@ -590,10 +586,6 @@ impl QuickAsk {
     }
 
     fn fit(&self, window: &mut Window) {
-        let expanded = self.history_open
-            || self.models_open
-            || !self.conversation.messages.is_empty()
-            || self.turn.prompt.is_some();
         let extra = if self.error.is_some() || self.notice.is_some() {
             100.
         } else {
@@ -607,38 +599,13 @@ impl QuickAsk {
             (180. + self.conversations.len().max(1) as f32 * 64.).min(540.)
         } else if self.models_open {
             (268. + self.models.len() as f32 * 36.).min(540.)
-        } else if expanded {
-            let message_height = |text: &str| {
-                let lines: usize = text
-                    .lines()
-                    .map(|line| line.chars().count().div_ceil(68).max(1))
-                    .sum();
-                66. + lines.max(1) as f32 * 22. + text.matches("![").count() as f32 * 260.
-            };
-            let mut content: f32 = self
-                .conversation
-                .messages
-                .iter()
-                .map(|message| {
-                    message_height(&message.content)
-                        + message.images.len().div_ceil(3) as f32 * 120.
-                })
-                .sum();
-            if let Some(prompt) = &self.turn.prompt {
-                content += message_height(prompt)
-                    + message_height(self.turn.visible_text())
-                    + self.turn_images.len().div_ceil(3) as f32 * 120.;
-            }
-            (190. + content + extra).min(580.)
-        } else if self.account.is_none() {
-            156. + extra
         } else {
-            132. + extra
+            // Chat height is measured after layout, including wrapped input and Markdown.
+            return;
         };
         let target = size(
             px(620.),
             px((height
-                + if self.composer_expanded { 72. } else { 0. }
                 + if self.draft_images.loading || !self.draft_images.images.is_empty() {
                     88.
                 } else {
@@ -1230,6 +1197,7 @@ fn drag_surface(id: &'static str) -> Stateful<Div> {
 
 fn activity_indicator(label: &'static str, cx: &App) -> AnyElement {
     div()
+        .flex_shrink_0()
         .flex()
         .items_center()
         .gap_2()
@@ -1270,6 +1238,7 @@ fn message_view(
     if message.role == "user" {
         let mut question = div()
             .id(("question", index))
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .items_end()
@@ -1374,6 +1343,7 @@ fn answer_view(
     let text: SharedString = text.to_owned().into();
     let mut answer = div()
         .id(("response", index))
+        .flex_shrink_0()
         .flex()
         .flex_col()
         .gap_1()
@@ -1501,8 +1471,8 @@ impl Render for QuickAsk {
         } else {
             rgba(0xffffffa8)
         };
+        let scroll = self.scroll.clone();
         let mut body = div()
-            .id("quick-ask-panel")
             .key_context("QuickAsk")
             .size_full()
             .flex()
@@ -1511,6 +1481,29 @@ impl Render for QuickAsk {
             .text_color(foreground)
             .font_family(".SystemUIFont")
             .overflow_hidden()
+            .when(!has_section, |body| {
+                body.on_children_prepainted(move |bounds, window, cx| {
+                    let mut height = bounds
+                        .iter()
+                        .fold(px(0.), |height, bounds| height + bounds.size.height);
+                    if expanded {
+                        // Replace the flexible viewport with its full content extent. This
+                        // also measures content shorter than the current viewport so it shrinks.
+                        let content = scroll
+                            .bounds_for_item(0)
+                            .zip(scroll.bounds_for_item(scroll.children_count().saturating_sub(1)))
+                            .map(|(first, last)| last.bottom() - first.top())
+                            .unwrap_or_default();
+                        height += content + window.rem_size() * 2. - scroll.bounds().size.height;
+                    }
+                    let minimum = px(if signed_in { 132. } else { 156. });
+                    let target = size(px(620.), height.ceil().clamp(minimum, px(620.)));
+                    if window.bounds().size != target {
+                        window.defer(cx, move |window, _| window.resize(target));
+                    }
+                })
+            })
+            .id("quick-ask-panel")
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.import_images(
                     native::ClipboardImages::Paths(paths.paths().to_vec()),
