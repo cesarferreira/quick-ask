@@ -4,6 +4,7 @@ use reqwest::{StatusCode, blocking::Client, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::Read,
     sync::atomic::{AtomicBool, Ordering},
@@ -33,6 +34,13 @@ impl ReasoningEffort {
             Self::High => "High",
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyEvent {
+    Delta(String),
+    Replace(String),
+    Searching(bool),
 }
 
 pub struct ReplyOptions<'a> {
@@ -143,7 +151,7 @@ pub fn stream_reply(
     options: ReplyOptions<'_>,
     messages: &[Message],
     cancel: &AtomicBool,
-    on_delta: impl FnMut(String),
+    on_delta: impl FnMut(ReplyEvent),
 ) -> Result<()> {
     stream_reply_at(
         "https://api.openai.com/v1",
@@ -152,7 +160,7 @@ pub fn stream_reply(
         messages,
         cancel,
         on_delta,
-        Duration::from_secs(120),
+        Duration::from_secs(300),
     )
 }
 
@@ -162,7 +170,7 @@ fn stream_reply_at(
     options: ReplyOptions<'_>,
     messages: &[Message],
     cancel: &AtomicBool,
-    mut on_delta: impl FnMut(String),
+    mut on_delta: impl FnMut(ReplyEvent),
     timeout: Duration,
 ) -> Result<()> {
     let model = options.model;
@@ -181,9 +189,10 @@ fn stream_reply_at(
     let mut payload = json!({
         "model": model,
         "input": request_input(messages, cancel)?,
-        "instructions": "You are a helpful assistant. Give clear, concise answers unless the user asks for detail.",
+        "instructions": "You are a helpful assistant. Give clear, concise answers unless the user asks for detail. Use web search when the user asks to search or when current information is needed. Cite sources for web results.",
         "store": false,
         "stream": true,
+        "tools": [{ "type": "web_search" }],
     });
     if let Some(effort) = options.reasoning_effort {
         payload["reasoning"] = json!({ "effort": effort });
@@ -379,6 +388,7 @@ struct SseDecoder {
     event_name: String,
     skip_lf: bool,
     started: bool,
+    text_parts: BTreeMap<(u64, usize), String>,
 }
 
 impl SseDecoder {
@@ -386,7 +396,7 @@ impl SseDecoder {
         &mut self,
         chunk: &[u8],
         cancel: &AtomicBool,
-        on_delta: &mut impl FnMut(String) -> Result<()>,
+        on_delta: &mut impl FnMut(ReplyEvent) -> Result<()>,
     ) -> Result<bool> {
         for &byte in chunk {
             if cancel.load(Ordering::Relaxed) {
@@ -414,10 +424,20 @@ impl SseDecoder {
         Ok(false)
     }
 
+    fn complete_message(&mut self, index: u64, item: &Value) {
+        if let Some(content) = item["content"].as_array() {
+            for (part, value) in content.iter().enumerate() {
+                if value["type"] == "output_text" {
+                    self.text_parts.insert((index, part), cited_text(value));
+                }
+            }
+        }
+    }
+
     fn process_line(
         &mut self,
         line: &[u8],
-        on_delta: &mut impl FnMut(String) -> Result<()>,
+        on_delta: &mut impl FnMut(ReplyEvent) -> Result<()>,
     ) -> Result<bool> {
         let mut line = std::str::from_utf8(line)
             .map_err(|_| anyhow!("OpenAI sent an invalid streaming event."))?;
@@ -443,9 +463,45 @@ impl SseDecoder {
                             .get("delta")
                             .and_then(Value::as_str)
                             .ok_or_else(|| anyhow!("OpenAI sent an invalid text event."))?;
-                        on_delta(delta.into())?;
+                        let key = (
+                            event["output_index"].as_u64().unwrap_or(0),
+                            event["content_index"].as_u64().unwrap_or(0) as usize,
+                        );
+                        self.text_parts.entry(key).or_default().push_str(delta);
+                        on_delta(ReplyEvent::Delta(delta.into()))?;
                     }
-                    "response.completed" => return Ok(true),
+                    "response.web_search_call.in_progress"
+                    | "response.web_search_call.searching" => {
+                        on_delta(ReplyEvent::Searching(true))?;
+                    }
+                    "response.web_search_call.completed" => {
+                        on_delta(ReplyEvent::Searching(false))?;
+                    }
+                    "response.output_item.done" if event["item"]["type"] == "message" => {
+                        self.complete_message(
+                            event["output_index"].as_u64().unwrap_or(0),
+                            &event["item"],
+                        );
+                        on_delta(ReplyEvent::Replace(
+                            self.text_parts.values().cloned().collect(),
+                        ))?;
+                    }
+                    "response.completed" => {
+                        // Completed responses also carry authoritative output, including annotations.
+                        if let Some(output) =
+                            event.pointer("/response/output").and_then(Value::as_array)
+                        {
+                            for (index, item) in output.iter().enumerate() {
+                                if item["type"] == "message" {
+                                    self.complete_message(index as u64, item);
+                                }
+                            }
+                            on_delta(ReplyEvent::Replace(
+                                self.text_parts.values().cloned().collect(),
+                            ))?;
+                        }
+                        return Ok(true);
+                    }
                     "response.incomplete" => {
                         bail!("The response was incomplete. Try again or start a new chat.")
                     }
@@ -482,11 +538,71 @@ impl SseDecoder {
     }
 }
 
+/// Convert API citation spans into ordinary Markdown so copying and saved history retain links.
+fn cited_text(part: &Value) -> String {
+    let text = part["text"].as_str().unwrap_or_default();
+    let mut citations = part["annotations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|annotation| annotation["type"] == "url_citation")
+        .filter_map(|annotation| {
+            let start = annotation["start_index"].as_u64()? as usize;
+            let end = annotation["end_index"].as_u64()? as usize;
+            let url = reqwest::Url::parse(annotation["url"].as_str()?).ok()?;
+            if !matches!(url.scheme(), "http" | "https") || start > end {
+                return None;
+            }
+            let title = annotation["title"]
+                .as_str()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| url.host_str().unwrap_or("Source"));
+            let title = title
+                .replace('\\', "\\\\")
+                .replace('[', "\\[")
+                .replace(']', "\\]")
+                .replace(['\n', '\r'], " ");
+            let url = url
+                .as_str()
+                .replace('<', "%3C")
+                .replace('>', "%3E")
+                .replace('\\', "%5C");
+            Some((start, end, format!("[{title}](<{url}>)")))
+        })
+        .collect::<Vec<_>>();
+    citations.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    boundaries.push(text.len());
+    let mut output = String::new();
+    let mut cursor = 0;
+    for (start, end, link) in citations {
+        let (Some(&start), Some(&end)) = (boundaries.get(start), boundaries.get(end)) else {
+            continue;
+        };
+        if start < cursor {
+            continue;
+        }
+        output.push_str(&text[cursor..start]);
+        let span = &text[start..end];
+        if !span.starts_with('') {
+            output.push_str(span);
+            output.push(' ');
+        }
+        output.push_str(&link);
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
 #[cfg(test)]
 fn consume_sse(
     mut reader: impl Read,
     cancel: &AtomicBool,
-    mut on_delta: impl FnMut(String) -> Result<()>,
+    mut on_delta: impl FnMut(ReplyEvent) -> Result<()>,
 ) -> Result<()> {
     let mut decoder = SseDecoder::default();
     let mut chunk = [0; 4096];
@@ -594,6 +710,14 @@ mod tests {
         time::Instant,
     };
     use tempfile::tempdir;
+
+    fn apply_event(output: &mut String, event: ReplyEvent) {
+        match event {
+            ReplyEvent::Delta(text) => output.push_str(&text),
+            ReplyEvent::Replace(text) => *output = text,
+            ReplyEvent::Searching(_) => {}
+        }
+    }
 
     fn server(
         status: u16,
@@ -768,7 +892,7 @@ mod tests {
             },
             &messages,
             &AtomicBool::new(false),
-            |text| output.push_str(&text),
+            |event| apply_event(&mut output, event),
             Duration::from_secs(2),
         )
         .unwrap();
@@ -785,7 +909,7 @@ mod tests {
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["model"], "fast");
         assert!(payload["instructions"].is_string());
-        assert_eq!(payload.as_object().unwrap().len(), 5);
+        assert_eq!(payload["tools"], json!([{"type": "web_search"}]));
     }
 
     fn message_with_images(role: &str, content: &str, paths: &[(&str, &Path)]) -> Message {
@@ -843,7 +967,7 @@ mod tests {
         );
         assert_eq!(payload["store"], false);
         assert_eq!(payload["stream"], true);
-        assert_eq!(payload.as_object().unwrap().len(), 5);
+        assert_eq!(payload["tools"], json!([{"type": "web_search"}]));
         let encoded = payload.to_string();
         assert!(!encoded.contains("private-"));
         assert!(!encoded.contains("images"));
@@ -996,6 +1120,75 @@ mod tests {
         assert_eq!(payload["input"][0]["content"].as_array().unwrap().len(), 33);
     }
 
+    #[test]
+    fn search_citations_become_clickable_without_losing_other_output() {
+        let events = [
+            json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Café 🙂 source"}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"type":"message","content":[{"type":"output_text","text":"Café 🙂 source","annotations":[{"type":"url_citation","start_index":7,"end_index":13,"url":"https://example.com/a(b)","title":"A [source]"}]}]}}),
+            json!({"type":"response.output_text.delta","output_index":3,"content_index":0,"delta":"\nMore details."}),
+            json!({"type":"response.completed"}),
+        ];
+        let fixture = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let mut output = String::new();
+        consume_sse(Cursor::new(fixture), &AtomicBool::new(false), |text| {
+            apply_event(&mut output, text);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            output,
+            "Café 🙂 source [A \\[source\\]](<https://example.com/a(b)>)\nMore details."
+        );
+    }
+
+    #[test]
+    fn search_progress_and_final_citations_survive_fragmented_streams() {
+        let events = [
+            json!({"type":"response.web_search_call.in_progress","item_id":"ws_1","output_index":0,"sequence_number":1}),
+            json!({"type":"response.web_search_call.searching","item_id":"ws_1","output_index":0,"sequence_number":2}),
+            json!({"type":"response.web_search_call.completed","item_id":"ws_1","output_index":0,"sequence_number":3}),
+            json!({"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"é 🙂 citeturn0search0"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"example"}},{"type":"message","content":[{"type":"output_text","text":"é 🙂 citeturn0search0","annotations":[{"type":"url_citation","start_index":4,"end_index":23,"url":"https://example.com/","title":"Example"}]}]}]}}),
+        ];
+        let fixture = events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>();
+        let mut progress = Vec::new();
+        let mut output = String::new();
+        consume_sse(
+            Fragmented(fixture.as_bytes()),
+            &AtomicBool::new(false),
+            |event| {
+                if let ReplyEvent::Searching(searching) = event {
+                    progress.push(searching);
+                }
+                apply_event(&mut output, event);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(progress, vec![true, true, false]);
+        assert_eq!(output, "é 🙂 [Example](<https://example.com/>)");
+    }
+
+    #[test]
+    fn invalid_citation_spans_and_non_web_urls_leave_answer_intact() {
+        for annotation in [
+            json!({"type":"url_citation","start_index":0,"end_index":500,"url":"https://example.com","title":"Bad range"}),
+            json!({"type":"url_citation","start_index":0,"end_index":2,"url":"javascript:alert(1)","title":"Bad URL"}),
+            json!({"type":"url_citation","start_index":2,"end_index":1,"url":"https://example.com","title":"Reversed range"}),
+        ] {
+            assert_eq!(
+                cited_text(&json!({"text":"é 🙂","annotations":[annotation]})),
+                "é 🙂"
+            );
+        }
+    }
+
     struct Fragmented<'a>(&'a [u8]);
     impl Read for Fragmented<'_> {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
@@ -1016,7 +1209,7 @@ mod tests {
             Fragmented(fixture.as_bytes()),
             &AtomicBool::new(false),
             |text| {
-                output.push_str(&text);
+                apply_event(&mut output, text);
                 Ok(())
             },
         )
@@ -1032,7 +1225,7 @@ mod tests {
             Fragmented(fixture.as_bytes()),
             &AtomicBool::new(false),
             |text| {
-                output.push_str(&text);
+                apply_event(&mut output, text);
                 Ok(())
             },
         )
@@ -1045,7 +1238,7 @@ mod tests {
         let fixture = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"private-token\"}}}\n\n";
         let mut output = String::new();
         let error = consume_sse(Cursor::new(fixture), &AtomicBool::new(false), |text| {
-            output.push_str(&text);
+            apply_event(&mut output, text);
             Ok(())
         })
         .unwrap_err()

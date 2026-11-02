@@ -1,3 +1,5 @@
+use quick_ask_core::chat::ReplyEvent;
+
 #[derive(Default)]
 pub struct Turn {
     pub id: u64,
@@ -5,6 +7,7 @@ pub struct Turn {
     pub text: String,
     pub busy: bool,
     pub network_done: bool,
+    searching: bool,
     visible_len: usize,
 }
 
@@ -38,6 +41,42 @@ impl Turn {
             self.text.push_str(text);
         }
     }
+    pub fn reply_event(&mut self, id: u64, event: ReplyEvent) {
+        if id != self.id || !self.busy {
+            return;
+        }
+        match event {
+            ReplyEvent::Delta(text) => {
+                self.searching = false;
+                self.delta(id, &text);
+            }
+            ReplyEvent::Replace(text) => {
+                // Replacements insert source links into already streamed text. Reveal from
+                // the first changed character, keeping the UTF-8 cursor on a boundary.
+                let common = self
+                    .text
+                    .chars()
+                    .zip(text.chars())
+                    .take_while(|(left, right)| left == right)
+                    .map(|(character, _)| character.len_utf8())
+                    .sum::<usize>();
+                self.visible_len = self.visible_len.min(common);
+                self.text = text;
+            }
+            ReplyEvent::Searching(searching) => self.searching = searching,
+        }
+    }
+
+    pub fn activity_label(&self) -> &'static str {
+        if self.searching {
+            "Searching the web…"
+        } else if self.text.is_empty() {
+            "Thinking…"
+        } else {
+            "Writing…"
+        }
+    }
+
     pub fn finish(&mut self, id: u64, success: bool) -> Option<(String, String)> {
         if id != self.id || !self.busy {
             return None;
@@ -60,6 +99,7 @@ impl Turn {
         self.text.clear();
         self.busy = false;
         self.network_done = false;
+        self.searching = false;
         self.visible_len = 0;
     }
 }
@@ -67,6 +107,42 @@ impl Turn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_activity_stops_on_text_and_ignores_previous_turns() {
+        use quick_ask_core::chat::ReplyEvent;
+        let mut turn = Turn::default();
+        let old = turn.begin("old".into());
+        let id = turn.begin("current".into());
+        turn.reply_event(old, ReplyEvent::Searching(true));
+        assert_eq!(turn.activity_label(), "Thinking…");
+        turn.reply_event(id, ReplyEvent::Searching(true));
+        assert_eq!(turn.activity_label(), "Searching the web…");
+        turn.reply_event(id, ReplyEvent::Delta("Answer".into()));
+        assert_eq!(turn.activity_label(), "Writing…");
+        turn.finish(id, false);
+        turn.reply_event(id, ReplyEvent::Replace("late answer".into()));
+        assert_eq!(turn.text, "Answer");
+    }
+
+    #[test]
+    fn citation_replacements_reveal_safely_and_commit_the_linked_answer() {
+        use quick_ask_core::chat::ReplyEvent;
+        let mut turn = Turn::default();
+        let id = turn.begin("question".into());
+        turn.delta(id, "Long text before citation");
+        while turn.advance() {}
+        turn.reply_event(
+            id,
+            ReplyEvent::Replace("é [Source](https://example.com)".into()),
+        );
+        assert_eq!(turn.visible_text(), "");
+        while turn.advance() {}
+        assert_eq!(
+            turn.finish(id, true),
+            Some(("question".into(), "é [Source](https://example.com)".into()))
+        );
+    }
 
     #[test]
     fn arriving_chunks_reveal_progressively_instead_of_a_single_jump() {

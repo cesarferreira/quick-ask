@@ -79,7 +79,13 @@ Partial responses are shown until you start another turn, but are not saved or
 included in later model context. Clicking another app or
 pressing Escape dismisses the panel; Quick Ask stays in the menu bar.
 
-Animated **Thinking…** and **Writing…** indicators show when a reply is in progress.
+Quick Ask can search the web when you ask it to search or when an answer needs
+current information. The model decides when to search. Source citations become
+clickable links and stay available in copied answers and saved local chats.
+Web search availability depends on the selected model and account/workspace policy.
+
+Animated **Thinking…**, **Searching the web…**, and **Writing…** indicators show
+when a reply is in progress.
 Text appears progressively, and the view follows the latest output. Scroll up to
 pause following; scroll back to the bottom or click **Jump to latest** to resume.
 
@@ -178,4 +184,4 @@ build output and `dist/`.
 
 Protocol and storage tests use local fixtures. They do not substitute for a real
 ChatGPT sign-in and live request. Chat with inline images and local history are
-supported; uploads, voice, web tools, and ChatGPT memory are not implemented.
+supported, along with web search; file uploads, voice, and ChatGPT memory are not implemented.

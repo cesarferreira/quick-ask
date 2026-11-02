@@ -15,7 +15,7 @@ use gpui_component::{
 };
 use quick_ask_core::{
     auth::{AccountSummary, AuthManager},
-    chat::{self, ImageAttachment, Message, Model, ReplyOptions},
+    chat::{self, ImageAttachment, Message, Model, ReplyEvent, ReplyOptions},
     history::{Conversation, HistoryStore},
 };
 use std::{
@@ -97,7 +97,7 @@ enum Event {
     Status(u64, String),
     Connected(u64, bool, Result<(AccountSummary, Vec<Model>), String>),
     SignedOut(Result<(), String>),
-    Delta(u64, String),
+    Reply(u64, ReplyEvent),
     Finished(u64, Result<(), String>),
     ImagesImported(u64, Vec<ImageAttachment>, Vec<String>),
 }
@@ -551,7 +551,7 @@ impl QuickAsk {
                     &messages,
                     &cancel,
                     |text| {
-                        let _ = tx.send(Event::Delta(id, text));
+                        let _ = tx.send(Event::Reply(id, text));
                     },
                 )
             })()
@@ -731,8 +731,8 @@ impl QuickAsk {
                         self.error = Some(error);
                     }
                 }
-                Event::Delta(id, text) => {
-                    self.turn.delta(id, &text);
+                Event::Reply(id, text) => {
+                    self.turn.reply_event(id, text);
                 }
                 Event::ImagesImported(ticket, images, errors) => {
                     if self.draft_images.complete(ticket, images) && !errors.is_empty() {
@@ -1106,12 +1106,7 @@ impl QuickAsk {
                 ));
             }
             if self.turn.busy {
-                let label = if self.turn.visible_text().is_empty() {
-                    "Thinking…"
-                } else {
-                    "Writing…"
-                };
-                list = list.child(activity_indicator(label, cx));
+                list = list.child(activity_indicator(self.turn.activity_label(), cx));
             }
         }
         list.into_any_element()
