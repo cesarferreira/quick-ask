@@ -19,6 +19,7 @@ image-webp = "=0.2.4"
 serde_json.workspace = true
 dirs.workspace = true
 gpui = { version = "=0.2.2", default-features = false }
+markdown = "=1.0.0"
 gpui-component = "=0.5.1"
 gpui-component-assets = "=0.5.1"
 global-hotkey = "0.9"

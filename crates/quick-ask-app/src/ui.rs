@@ -130,6 +130,7 @@ pub struct QuickAsk {
     status: String,
     scroll: ScrollHandle,
     follow_reply: bool,
+    manually_sized: bool,
     image_store: AttachmentStore,
     draft_images: DraftImages,
     turn_images: Vec<ImageAttachment>,
@@ -318,10 +319,14 @@ impl QuickAsk {
         });
 
         let mut last_size = window.bounds().size;
-        let bounds = cx.observe_window_bounds(window, move |_, window, _| {
+        let bounds = cx.observe_window_bounds(window, move |this, window, cx| {
             let size = window.bounds().size;
             if size != last_size {
                 last_size = size;
+                if native::panel_is_resizing(window) {
+                    this.manually_sized = true;
+                    cx.notify();
+                }
                 native::keep_panel_on_screen(window);
             }
         });
@@ -399,6 +404,7 @@ impl QuickAsk {
             status: String::new(),
             scroll: ScrollHandle::new(),
             follow_reply: true,
+            manually_sized: false,
             image_store,
             draft_images: DraftImages::default(),
             turn_images: vec![],
@@ -592,6 +598,9 @@ impl QuickAsk {
     }
 
     fn fit(&self, window: &mut Window) {
+        if self.manually_sized || native::panel_is_resizing(window) {
+            return;
+        }
         let extra = if self.error.is_some() || self.notice.is_some() {
             100.
         } else {
@@ -610,7 +619,7 @@ impl QuickAsk {
             return;
         };
         let target = size(
-            px(620.),
+            window.bounds().size.width,
             px((height
                 + if self.draft_images.loading || !self.draft_images.images.is_empty() {
                     88.
@@ -1321,7 +1330,95 @@ fn message_view(
     }
 }
 
+/// Use wrapping cells instead of TextView's single-line, truncated table layout.
 fn markdown_view(
+    id: impl Into<ElementId>,
+    text: SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let tables = crate::markdown_tables::tables(&text);
+    if tables.is_empty() {
+        return basic_markdown_view(id, text, window, cx).into_any_element();
+    }
+    let mut content = div().id(id).w_full().min_w_0().flex().flex_col();
+    let mut start = 0;
+    for table in tables {
+        if !text[start..table.start].trim().is_empty() {
+            content = content.child(basic_markdown_view(
+                ("table-prose", start),
+                text[start..table.start].to_owned().into(),
+                window,
+                cx,
+            ));
+        }
+        let columns = table.align.len().max(1);
+        let mut grid = div()
+            .w_full()
+            .min_w_0()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .mb_4();
+        let row_count = table.rows.len();
+        for (row_index, row) in table.rows.iter().enumerate() {
+            let mut cells = div()
+                .w_full()
+                .flex()
+                .when(row_index + 1 < row_count, |row| {
+                    row.border_b_1().border_color(cx.theme().border)
+                })
+                .when(row_index == 0, |row| row.bg(cx.theme().muted));
+            for column in 0..columns {
+                let cell = row.get(column).copied().unwrap_or("");
+                let align = table.align[column];
+                cells = cells.child(
+                    div()
+                        .w(relative(1. / columns as f32))
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .px_2()
+                        .py_2()
+                        .when(column + 1 < columns, |cell| {
+                            cell.border_r_1().border_color(cx.theme().border)
+                        })
+                        .when(align == markdown::mdast::AlignKind::Center, |cell| {
+                            cell.text_center()
+                        })
+                        .when(align == markdown::mdast::AlignKind::Right, |cell| {
+                            cell.text_right()
+                        })
+                        .when(row_index == 0, |cell| {
+                            cell.font_weight(FontWeight::SEMIBOLD)
+                        })
+                        .child(basic_markdown_view(
+                            SharedString::from(format!(
+                                "table-{}-{row_index}-{column}",
+                                table.start
+                            )),
+                            cell.to_owned().into(),
+                            window,
+                            cx,
+                        )),
+                );
+            }
+            grid = grid.child(cells);
+        }
+        content = content.child(grid);
+        start = table.end;
+    }
+    if !text[start..].trim().is_empty() {
+        content = content.child(basic_markdown_view(
+            ("table-prose", start),
+            text[start..].to_owned().into(),
+            window,
+            cx,
+        ));
+    }
+    content.into_any_element()
+}
+
+fn basic_markdown_view(
     id: impl Into<ElementId>,
     text: SharedString,
     window: &mut Window,
@@ -1491,8 +1588,11 @@ impl Render for QuickAsk {
             .text_color(foreground)
             .font_family(".SystemUIFont")
             .overflow_hidden()
-            .when(!has_section, |body| {
+            .when(!has_section && !self.manually_sized, |body| {
                 body.on_children_prepainted(move |bounds, window, cx| {
+                    if native::panel_is_resizing(window) {
+                        return;
+                    }
                     let mut height = bounds
                         .iter()
                         .fold(px(0.), |height, bounds| height + bounds.size.height);
@@ -1507,9 +1607,16 @@ impl Render for QuickAsk {
                         height += content + window.rem_size() * 2. - scroll.bounds().size.height;
                     }
                     let minimum = px(if signed_in { 112. } else { 156. });
-                    let target = size(px(620.), height.ceil().clamp(minimum, px(620.)));
+                    let target = size(
+                        window.bounds().size.width,
+                        height.ceil().clamp(minimum, px(620.)),
+                    );
                     if window.bounds().size != target {
-                        window.defer(cx, move |window, _| window.resize(target));
+                        window.defer(cx, move |window, _| {
+                            if !native::panel_is_resizing(window) {
+                                window.resize(target);
+                            }
+                        });
                     }
                 })
             })

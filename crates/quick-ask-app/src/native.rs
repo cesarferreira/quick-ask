@@ -26,6 +26,10 @@ pub enum ClipboardImages {
     Bytes(Vec<u8>),
 }
 
+pub fn panel_is_resizing(window: &Window) -> bool {
+    native_window(window).is_some_and(|native| native.inLiveResize())
+}
+
 pub fn mouse_button_pressed() -> bool {
     NSEvent::pressedMouseButtons() != 0
 }
@@ -304,7 +308,11 @@ pub fn install_glass(window: &mut Window) {
     // GPUI's titlebar: None still sets Titled | FullSizeContentView, which
     // leaves an NSThemeFrame outline outside the glass. Use an actual borderless
     // panel, retaining NonactivatingPanel so typing does not activate the app.
-    native.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
+    native.setStyleMask(
+        NSWindowStyleMask::Borderless
+            | NSWindowStyleMask::NonactivatingPanel
+            | NSWindowStyleMask::Resizable,
+    );
     native.setHasShadow(true);
     let Some(content) = native.contentView() else {
         return;

@@ -5213,6 +5213,7 @@ dependencies = [
  "gpui-component-assets",
  "image",
  "image-webp",
+ "markdown",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",

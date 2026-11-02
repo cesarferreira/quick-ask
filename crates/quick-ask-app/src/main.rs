@@ -3,6 +3,7 @@ mod downloads;
 mod draft_images;
 mod image_http;
 mod live_markdown;
+mod markdown_tables;
 mod native;
 mod turn;
 mod ui;
@@ -64,7 +65,8 @@ fn main() -> anyhow::Result<()> {
                 kind: WindowKind::PopUp,
                 show: false,
                 focus: false,
-                is_resizable: false,
+                is_resizable: true,
+                window_min_size: Some(size(px(420.), px(112.))),
                 is_minimizable: false,
                 window_background: WindowBackgroundAppearance::Transparent,
                 app_id: Some("dev.cesar.quickask".into()),
