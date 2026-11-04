@@ -33,7 +33,7 @@ const ACCENT: u32 = 0x0a84ff;
 const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 const DONE_FEEDBACK: Duration = Duration::from_millis(1500);
 
-fn key_bindings() -> [KeyBinding; 6] {
+fn key_bindings() -> [KeyBinding; 7] {
     [
         KeyBinding::new("escape", Dismiss, Some("QuickAsk")),
         KeyBinding::new("cmd-n", NewChat, Some("QuickAsk")),
@@ -42,6 +42,11 @@ fn key_bindings() -> [KeyBinding; 6] {
         KeyBinding::new("cmd-q", Quit, Some("QuickAsk")),
         KeyBinding::new(
             "shift-enter",
+            gpui_component::input::Enter { secondary: true },
+            Some("QuickAsk > Input"),
+        ),
+        KeyBinding::new(
+            "alt-enter",
             gpui_component::input::Enter { secondary: true },
             Some("QuickAsk > Input"),
         ),
@@ -2122,11 +2127,20 @@ mod tests {
 
     #[test]
     fn shift_enter_in_nested_input_inserts_newline_without_submitting() {
-        let keystroke = Keystroke::parse("shift-enter").unwrap();
+        assert_newline_binding("shift-enter");
+    }
+
+    #[test]
+    fn option_enter_in_nested_input_inserts_newline_without_submitting() {
+        assert_newline_binding("alt-enter");
+    }
+
+    fn assert_newline_binding(shortcut: &str) {
+        let keystroke = Keystroke::parse(shortcut).unwrap();
         let binding = key_bindings()
             .into_iter()
             .find(|binding| binding.match_keystrokes(&[keystroke.clone()]) == Some(false))
-            .expect("Shift+Enter must have a binding");
+            .expect("Newline shortcut must have a binding");
         let contexts = [
             KeyContext::parse("QuickAsk").unwrap(),
             KeyContext::parse("Input").unwrap(),
@@ -2139,7 +2153,10 @@ mod tests {
             .action()
             .as_any()
             .downcast_ref::<gpui_component::input::Enter>()
-            .expect("Shift+Enter must invoke the input's Enter action");
-        assert!(action.secondary, "Shift+Enter must not submit the prompt");
+            .expect("Newline shortcut must invoke the input's Enter action");
+        assert!(
+            action.secondary,
+            "Newline shortcut must not submit the prompt"
+        );
     }
 }
