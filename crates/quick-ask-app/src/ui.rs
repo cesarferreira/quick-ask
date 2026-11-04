@@ -33,6 +33,21 @@ const ACCENT: u32 = 0x0a84ff;
 const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 const DONE_FEEDBACK: Duration = Duration::from_millis(1500);
 
+fn key_bindings() -> [KeyBinding; 6] {
+    [
+        KeyBinding::new("escape", Dismiss, Some("QuickAsk")),
+        KeyBinding::new("cmd-n", NewChat, Some("QuickAsk")),
+        KeyBinding::new("cmd-h", ShowHistory, Some("QuickAsk")),
+        KeyBinding::new("cmd-shift-c", CopyAnswer, Some("QuickAsk")),
+        KeyBinding::new("cmd-q", Quit, Some("QuickAsk")),
+        KeyBinding::new(
+            "shift-enter",
+            gpui_component::input::Enter { secondary: true },
+            Some("QuickAsk > Input"),
+        ),
+    ]
+}
+
 /// The button that last finished a copy or download; it shows a check until the feedback expires.
 #[derive(Default)]
 struct DoneButton {
@@ -261,18 +276,7 @@ impl QuickAsk {
         data_dir: PathBuf,
         shell: anyhow::Result<NativeShell>,
     ) -> Self {
-        cx.bind_keys([
-            KeyBinding::new("escape", Dismiss, Some("QuickAsk")),
-            KeyBinding::new("cmd-n", NewChat, Some("QuickAsk")),
-            KeyBinding::new("cmd-h", ShowHistory, Some("QuickAsk")),
-            KeyBinding::new("cmd-shift-c", CopyAnswer, Some("QuickAsk")),
-            KeyBinding::new("cmd-q", Quit, Some("QuickAsk")),
-            KeyBinding::new(
-                "shift-enter",
-                gpui_component::input::Enter { secondary: true },
-                Some("QuickAsk && Input"),
-            ),
-        ]);
+        cx.bind_keys(key_bindings());
         Theme::global_mut(cx).caret = rgb(ACCENT).into();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -2108,5 +2112,34 @@ impl Render for QuickAsk {
             );
         }
         body
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_bindings;
+    use gpui::{KeyContext, Keystroke};
+
+    #[test]
+    fn shift_enter_in_nested_input_inserts_newline_without_submitting() {
+        let keystroke = Keystroke::parse("shift-enter").unwrap();
+        let binding = key_bindings()
+            .into_iter()
+            .find(|binding| binding.match_keystrokes(&[keystroke.clone()]) == Some(false))
+            .expect("Shift+Enter must have a binding");
+        let contexts = [
+            KeyContext::parse("QuickAsk").unwrap(),
+            KeyContext::parse("Input").unwrap(),
+        ];
+        let predicate = binding.predicate().unwrap();
+        assert_eq!(predicate.depth_of(&contexts), Some(2));
+        assert_eq!(predicate.depth_of(&contexts[..1]), None);
+        assert_eq!(predicate.depth_of(&contexts[1..]), None);
+        let action = binding
+            .action()
+            .as_any()
+            .downcast_ref::<gpui_component::input::Enter>()
+            .expect("Shift+Enter must invoke the input's Enter action");
+        assert!(action.secondary, "Shift+Enter must not submit the prompt");
     }
 }
